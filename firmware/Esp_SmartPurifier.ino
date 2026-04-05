@@ -62,8 +62,9 @@ String lastArchivedDateStr = "";
 long lastIstoricSaveTime = 0; 
 unsigned long tAntSenzor = 0, tAntFB = 0, tAntEcran = 0, tAntLive = 0, tAntFading = 0, tAntRpm = 0, tAntWifi = 0, tAntVocSave = 0;
 
-// WATCHDOG SENZOR
+// WATCHDOG SI WARM-UP SENZOR
 unsigned long tUltimaCitireReusita = 0; 
+unsigned long tSenzorStart = 0; // Inregistreaza cand a pornit fizic masuratoarea
 
 int paginaCurenta = 1;
 bool areDate = false;
@@ -72,6 +73,7 @@ int vitezaDinAplicatie = 0;
 int targetFanSpeed = 0;   
 int currentFanSpeed = 0;  
 int rpmReal = 0; 
+bool modLiveRapid = false;
 
 float offsetTemperatura = -1.0;
 
@@ -169,7 +171,7 @@ String extrageArhivaIeri(String dateCurente, int puncteAzi) {
 }
 
 // =========================================================================
-// FILTRUL ORIGINAL RPM
+// FILTRUL ORIGINAL RPM (Digital Low-Pass Filter)
 // =========================================================================
 esp_timer_handle_t tacho_timer;
 volatile unsigned int validPulseCount = 0;
@@ -195,12 +197,16 @@ unsigned long timpUltimaSchimbareAuto = 0;
 int vitezaAutoCurenta = 0;
 bool eraAutoInainte = false;
 
-float pm1=0, pm25=0, pm4=0, pm10=0, umiditate=0, temp=0, voc=0, nox=0;
+// Initializam gazele cu 65535 pt a declansa starea de "Init..." pe ecran si aplicatie
+float pm1=0, pm25=0, pm4=0, pm10=0, umiditate=0, temp=0, voc=65535, nox=65535;
 uint16_t co2=0;
+
+// Variabile de Suma
 float sumPM1 = 0, sumPM25 = 0, sumPM4 = 0, sumPM10 = 0, sumTemp = 0, sumUmid = 0, sumVOC = 0, sumNOx = 0;
 unsigned long sumCO2 = 0;
 
-int countAveraging = 0, countVOC = 0, countNOx = 0;
+// Contoare INDEPENDENTE pentru fiecare tip de senzor
+int countPM = 0, countCO2 = 0, countClima = 0, countVOC = 0, countNOx = 0;
 
 String istPM25="", istCO2="", istVOC="", istNOx="", istTemp="", istUmid="", istPM1="", istPM4="", istPM10="";
 String jurnalErori = "";
@@ -245,6 +251,7 @@ void adaugaInIstoric(String &istoricActual, String valoareNoua, int puncteLipsa)
   }
 }
 
+// BUG 2 REPARAT: Ecranul OLED stie acum sa arate "Init..." in timpul warm-up-ului
 void deseneazaPagina(int pag) {
   u8g2.clearBuffer(); u8g2.setFont(u8g2_font_ncenB08_tr); 
   if (pag == 1) { 
@@ -253,17 +260,31 @@ void deseneazaPagina(int pag) {
       if (isAutoMode) { u8g2.print(" (Auto)"); } else { u8g2.print(" (Man)"); }
       u8g2.setCursor(OFFSET_X, OFFSET_Y + 45); u8g2.print("RPM Real: "); u8g2.print(rpmReal);
   } else if (pag == 2) { 
-      u8g2.drawStr(OFFSET_X, OFFSET_Y + 12, "== PRAF (ug/m3) =="); u8g2.setCursor(OFFSET_X, OFFSET_Y + 30); u8g2.print("PM1: "); u8g2.print(pm1, 1);
+      u8g2.drawStr(OFFSET_X, OFFSET_Y + 12, "== PRAF (ug/m3) =="); 
+      u8g2.setCursor(OFFSET_X, OFFSET_Y + 30); u8g2.print("PM1: "); u8g2.print(pm1, 1);
       u8g2.setCursor(OFFSET_X + 64, OFFSET_Y + 30); u8g2.print("PM2.5: "); u8g2.print(pm25, 1);
       u8g2.setCursor(OFFSET_X, OFFSET_Y + 50); u8g2.print("PM4: "); u8g2.print(pm4, 1);
       u8g2.setCursor(OFFSET_X + 64, OFFSET_Y + 50); u8g2.print("PM10: "); u8g2.print(pm10, 1);
   } else if (pag == 3) { 
-      u8g2.drawStr(OFFSET_X, OFFSET_Y + 12, "== GAZE (ppm/idx) =="); u8g2.setCursor(OFFSET_X, OFFSET_Y + 30); u8g2.print("CO2 : "); u8g2.print(co2);
-      u8g2.setCursor(OFFSET_X, OFFSET_Y + 45); u8g2.print("VOC : "); u8g2.print((int)voc);
-      u8g2.setCursor(OFFSET_X, OFFSET_Y + 60); if (nox > 1000) u8g2.print("NOx : Init..."); else { u8g2.print("NOx : "); u8g2.print((int)nox); }
+      u8g2.drawStr(OFFSET_X, OFFSET_Y + 12, "== GAZE (ppm/idx) =="); 
+      
+      u8g2.setCursor(OFFSET_X, OFFSET_Y + 30); 
+      if (co2 == 0) u8g2.print("CO2 : Init..."); else { u8g2.print("CO2 : "); u8g2.print(co2); }
+      
+      u8g2.setCursor(OFFSET_X, OFFSET_Y + 45); 
+      if (voc > 500) u8g2.print("VOC : Init..."); else { u8g2.print("VOC : "); u8g2.print((int)voc); }
+      
+      u8g2.setCursor(OFFSET_X, OFFSET_Y + 60); 
+      if (nox > 500) u8g2.print("NOx : Init..."); else { u8g2.print("NOx : "); u8g2.print((int)nox); }
   } else if (pag == 4) { 
-      u8g2.drawStr(OFFSET_X + 16, OFFSET_Y + 12, "== AMBIENTA =="); u8g2.setCursor(OFFSET_X, OFFSET_Y + 30); u8g2.print("Temp: "); u8g2.print(temp, 1); u8g2.print(" C");
-      u8g2.setCursor(OFFSET_X, OFFSET_Y + 45); u8g2.print("Umid: "); u8g2.print(umiditate, 1); u8g2.print(" %");
+      u8g2.drawStr(OFFSET_X + 16, OFFSET_Y + 12, "== AMBIENTA =="); 
+      
+      u8g2.setCursor(OFFSET_X, OFFSET_Y + 30); 
+      if (temp == 0) u8g2.print("Temp: Init..."); else { u8g2.print("Temp: "); u8g2.print(temp, 1); u8g2.print(" C"); }
+      
+      u8g2.setCursor(OFFSET_X, OFFSET_Y + 45); 
+      if (umiditate == 0) u8g2.print("Umid: Init..."); else { u8g2.print("Umid: "); u8g2.print(umiditate, 1); u8g2.print(" %"); }
+      
       struct tm timeinfo;
       if (getLocalTime(&timeinfo)) { char timeStringBuff[10]; strftime(timeStringBuff, sizeof(timeStringBuff), "%H:%M", &timeinfo); u8g2.setCursor(OFFSET_X, OFFSET_Y + 60); u8g2.print("Ora: "); u8g2.print(timeStringBuff); } else { u8g2.setCursor(OFFSET_X, OFFSET_Y + 60); u8g2.print("Ora: Sync.."); }
   }
@@ -289,7 +310,7 @@ void setup() {
   
   ledcAttach(PIN_FAN_PWM, PWM_FRECVENTA, PWM_REZOLUTIE); ledcWrite(PIN_FAN_PWM, 0); 
   
-  pinMode(PIN_FAN_RPM, INPUT); 
+  pinMode(PIN_FAN_RPM, INPUT_PULLUP); 
   const esp_timer_create_args_t tacho_timer_args = { .callback = &tachoPoll, .name = "tacho_poll" };
   esp_timer_create(&tacho_timer_args, &tacho_timer); 
   esp_timer_start_periodic(tacho_timer, 250); 
@@ -304,7 +325,6 @@ void setup() {
   stocare.begin("smart_air", false);
   offsetTemperatura = stocare.getFloat("tempOffset", 0.0);
 
-  // START SECVENTA DATASHEET INITIALIZARE SENZOR
   sen66.begin(Wire, 0x6B); 
   sen66.deviceReset(); 
   delay(1200); 
@@ -319,11 +339,11 @@ void setup() {
 
   sen66.startContinuousMeasurement();
   delay(50); 
-  
+  tSenzorStart = millis(); // Baza de timp pentru warm-up
+  tUltimaCitireReusita = millis();
+
   sen66.setTemperatureOffsetParameters((int16_t)(offsetTemperatura * 200), 0, 0, 0);
   delay(20); 
-
-  tUltimaCitireReusita = millis(); 
 
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD); WiFi.setSleep(false); 
   
@@ -388,6 +408,7 @@ void loop() {
       }
   }
 
+  // Calcul Turație Reală (1 secunda)
   if (t - tAntRpm >= 1000) {
       static unsigned int pulsuriTrecute[3] = {0, 0, 0}; static byte indexPuls = 0;
       
@@ -406,9 +427,6 @@ void loop() {
       tAntRpm = t;
   }
 
-  // ======================================================================================
-  // CITIRE SENZOR - 1000ms conform Datasheet (New readings available every second)
-  // ======================================================================================
   if (t - tAntSenzor >= 1000) {
       tAntSenzor = t; 
       updateState("Citire_SEN66");
@@ -425,17 +443,44 @@ void loop() {
           tUltimaCitireReusita = t; 
           
           if (t_co2 != 65535) { 
-              temp = t_temp; 
-              umiditate = t_umid;
-              pm1=t_pm1; pm25=t_pm25; pm4=t_pm4; pm10=t_pm10; voc=t_voc; nox=t_nox; co2=t_co2; 
-              areDate = true; 
+              // Calculam cat timp a trecut de la initierea hardware a senzorului
+              unsigned long uptimeSenzor = t - tSenzorStart;
               
-              if (millis() > 30000) {
-                  sumPM1 += pm1; sumPM25 += pm25; sumPM4 += pm4; sumPM10 += pm10; sumTemp += temp; sumUmid += umiditate; sumCO2 += co2; 
-                  countAveraging++; 
-                  if (voc <= 1000) { sumVOC += voc; countVOC++; }
-                  if (nox <= 1000) { sumNOx += nox; countNOx++; }
+              bool prafValid = (uptimeSenzor >= 20000);
+              bool co2Valid = (uptimeSenzor >= 20000);
+              bool climaValid = (uptimeSenzor >= 60000);
+              bool gazeValid = (uptimeSenzor >= 60000);
+
+              // 1. PRAF (Dupa 20s)
+              if (prafValid) {
+                  pm1 = t_pm1; pm25 = t_pm25; pm4 = t_pm4; pm10 = t_pm10;
+                  sumPM1 += pm1; sumPM25 += pm25; sumPM4 += pm4; sumPM10 += pm10;
+                  countPM++;
               }
+
+              // 2. CO2 (Dupa 20s)
+              if (co2Valid) {
+                  co2 = t_co2;
+                  sumCO2 += co2;
+                  countCO2++;
+              }
+
+              // 3. CLIMA (Dupa 60s)
+              if (climaValid) {
+                  temp = t_temp; umiditate = t_umid;
+                  sumTemp += temp; sumUmid += umiditate;
+                  countClima++;
+              }
+
+              // 4. GAZE (Dupa 60s) - extra filtru tehnic de siguranță <= 500
+              if (gazeValid) {
+                  if (t_voc <= 500) { voc = t_voc; sumVOC += voc; countVOC++; }
+                  if (t_nox <= 500) { nox = t_nox; sumNOx += nox; countNOx++; }
+              }
+              
+              // Marcam ca avem macar setul de baza functional (praf si co2) dupa 20s
+              areDate = (prafValid || co2Valid || climaValid || gazeValid);
+              
           } else {
               areDate = false; 
           }
@@ -443,9 +488,6 @@ void loop() {
       updateState("Running_Loop");
   }
 
-  // ======================================================================================
-  // WATCHDOG SENZOR
-  // ======================================================================================
   if (t - tUltimaCitireReusita > 15000) {
       tUltimaCitireReusita = t; 
       areDate = false; 
@@ -475,17 +517,15 @@ void loop() {
       
       sen66.startContinuousMeasurement();
       tReset = millis(); while(millis() - tReset < 50) { yield(); } 
-      
+      tSenzorStart = millis(); // Resetam counterul de warm-up dupa un hardware restart
+
       sen66.setTemperatureOffsetParameters((int16_t)(offsetTemperatura * 200), 0, 0, 0);
       tReset = millis(); while(millis() - tReset < 20) { yield(); } 
       
       updateState("Running_Loop");
   }
 
-  // ======================================================================================
-  // SALVARE VOC - Executata "din zbor", FARA stopMeasurement() (Datasheet Pag. 46)
-  // ======================================================================================
-  if (areDate && (t - tAntVocSave >= 14400000)) { 
+  if (areDate && (t - tAntVocSave >= 21600000)) { 
       tAntVocSave = t; updateState("Salvare_Calibrare_VOC");
       
       uint8_t currentVocState[8];
@@ -536,13 +576,22 @@ void loop() {
           if (Firebase.RTDB.getBool(&fbdoCitire, "/SenzoriAer/setari/night_mode")) nightModeApp = fbdoCitire.boolData();
       }
 
-      if (nightModeApp) { u8g2.clearBuffer(); u8g2.sendBuffer(); rgbLed.clear(); rgbLed.show(); } 
+      if (nightModeApp) { 
+          u8g2.clearBuffer(); u8g2.sendBuffer(); rgbLed.clear(); rgbLed.show(); 
+      } 
       else {
-          if (pm25 >= 55 || co2 >= 1500 || voc >= 400 || nox >= 300) rgbLed.setPixelColor(0, rgbLed.Color(255, 0, 0)); 
-          else if (pm25 >= 35 || co2 >= 1000 || voc >= 250 || nox >= 150) rgbLed.setPixelColor(0, rgbLed.Color(255, 100, 0)); 
-          else if (pm25 >= 12 || co2 >= 800 || voc >= 150 || nox >= 20) rgbLed.setPixelColor(0, rgbLed.Color(255, 255, 0)); 
-          else rgbLed.setPixelColor(0, rgbLed.Color(0, 255, 0)); 
-          rgbLed.show(); paginaCurenta++; if(paginaCurenta > 4) paginaCurenta = 1; deseneazaPagina(paginaCurenta); 
+          // BUG 1 REPARAT: LED-ul nu se va mai aprinde rosu eronat cand gaseste 65535 la pornire
+          if (pm25 >= 55 || co2 >= 1500 || (voc >= 400 && voc <= 500) || (nox >= 300 && nox <= 500)) 
+              rgbLed.setPixelColor(0, rgbLed.Color(255, 0, 0)); 
+          else if (pm25 >= 35 || co2 >= 1000 || (voc >= 250 && voc <= 500) || (nox >= 150 && nox <= 500)) 
+              rgbLed.setPixelColor(0, rgbLed.Color(255, 100, 0)); 
+          else if (pm25 >= 12 || (co2 >= 800 && co2 != 0) || (voc >= 150 && voc <= 500) || (nox >= 20 && nox <= 500)) 
+              rgbLed.setPixelColor(0, rgbLed.Color(255, 255, 0)); 
+          else 
+              rgbLed.setPixelColor(0, rgbLed.Color(0, 255, 0)); 
+          
+          rgbLed.show(); 
+          paginaCurenta++; if(paginaCurenta > 4) paginaCurenta = 1; deseneazaPagina(paginaCurenta); 
       }
       updateState("Running_Loop");
   }
@@ -573,6 +622,10 @@ void loop() {
 
   if (WiFi.status() == WL_CONNECTED && Firebase.ready() && firebaseGata && (t - tAntFB >= 2000)) {
       tAntFB = t; updateState("Ascultare_Comenzi_FB");
+      
+      esp_task_wdt_reset(); yield(); 
+      if (Firebase.RTDB.getBool(&fbdoCitire, "/SenzoriAer/setari/live_mode")) { modLiveRapid = fbdoCitire.boolData(); }
+
       static int pasCitire = 0; 
       
       if (pasCitire == 0) {
@@ -632,8 +685,8 @@ void loop() {
                   sen66.startFanCleaning(); 
                   unsigned long tCuratare = millis();
                   while(millis() - tCuratare < 10000) { ArduinoOTA.handle(); esp_task_wdt_reset(); yield(); delay(10); }
-                  
                   sen66.startContinuousMeasurement();
+                  
                   unsigned long tWait = millis();
                   while(millis() - tWait < 50) { esp_task_wdt_reset(); yield(); }
                   
@@ -651,7 +704,12 @@ void loop() {
       esp_task_wdt_reset(); yield(); updateState("Running_Loop");
   }
 
-  unsigned long intervalTrimitere = (currentFanSpeed != targetFanSpeed) ? 1500 : 10000;
+  unsigned long intervalTrimitere = 10000; 
+  if (currentFanSpeed != targetFanSpeed) {
+      intervalTrimitere = 1000; 
+  } else if (modLiveRapid == true) {
+      intervalTrimitere = 1000; 
+  }
   
   if (WiFi.status() == WL_CONNECTED && Firebase.ready() && firebaseGata && (t - tAntLive >= intervalTrimitere)) {
       tAntLive = t; updateState("Trimitere_Live_FB");
@@ -671,8 +729,16 @@ void loop() {
           jsonLive.set("PM1", pm1); jsonLive.set("PM25", pm25); jsonLive.set("PM4", pm4); jsonLive.set("PM10", pm10); 
           jsonLive.set("Temperatura", temp); jsonLive.set("Umiditate", umiditate);
       }
-
-      Firebase.RTDB.updateNodeAsync(&fbdoScriere, "/SenzoriAer", &jsonLive);
+// Trimitem asincron, dar verificam rezultatul trimiterii (Daca bufferul/conexiunea da rateu)
+      if (!Firebase.RTDB.updateNodeAsync(&fbdoScriere, "/SenzoriAer", &jsonLive)) {
+          String motivEroare = fbdoScriere.errorReason();
+          Serial.println("⚠️ [AVERTISMENT] Pachet Live pierdut! Motiv: " + motivEroare);
+          
+          // Daca e o eroare de memorie RAM sau buffer plin a librariei, scriem si in jurnalul de Firebase (daca isi revine)
+          if (motivEroare.indexOf("buffer") != -1 || motivEroare.indexOf("memory") != -1) {
+              logSystem("Eroare buffer Live FB: " + motivEroare);
+          }
+      }
       updateState("Running_Loop");
   }
 
@@ -727,15 +793,25 @@ void loop() {
 
           String strPM25 = "-999", strCO2 = "-999", strVOC = "-999", strNOx = "-999", strTemp = "-999", strUmid = "-999", strPM1 = "-999", strPM4 = "-999", strPM10 = "-999";
 
-          if (countAveraging > 0) {
-              float avgPM1 = sumPM1 / countAveraging; float avgPM25 = sumPM25 / countAveraging; float avgPM4 = sumPM4 / countAveraging; float avgPM10 = sumPM10 / countAveraging;
-              float avgTemp = sumTemp / countAveraging; float avgUmid = sumUmid / countAveraging; int avgCO2 = sumCO2 / countAveraging;
-              float avgVOC = (countVOC > 0) ? (sumVOC / countVOC) : 0; float avgNOx = (countNOx > 0) ? (sumNOx / countNOx) : 0;
-
-              strNOx = (avgNOx == 0 && nox > 1000) ? "-999" : String((int)avgNOx); 
-              strVOC = (avgVOC == 0 && voc > 1000) ? "-999" : String((int)avgVOC);
-              strPM25 = String(avgPM25, 1); strCO2 = String(avgCO2); strTemp = String(avgTemp, 1); strUmid = String(avgUmid, 1);
-              strPM1 = String(avgPM1, 1); strPM4 = String(avgPM4, 1); strPM10 = String(avgPM10, 1);
+          // MEDII CALCULATE INDEPENDENT DOAR DACA AU TRECUT DE WARM-UP!
+          if (countPM > 0) {
+              strPM1 = String(sumPM1 / countPM, 1); 
+              strPM25 = String(sumPM25 / countPM, 1); 
+              strPM4 = String(sumPM4 / countPM, 1); 
+              strPM10 = String(sumPM10 / countPM, 1);
+          }
+          if (countCO2 > 0) {
+              strCO2 = String((int)round((float)sumCO2 / countCO2));
+          }
+          if (countClima > 0) {
+              strTemp = String(sumTemp / countClima, 1); 
+              strUmid = String(sumUmid / countClima, 1);
+          }
+          if (countVOC > 0) {
+              strVOC = String((int)round(sumVOC / countVOC));
+          }
+          if (countNOx > 0) {
+              strNOx = String((int)round(sumNOx / countNOx));
           }
 
           adaugaInIstoric(istPM25, strPM25, intervalePierdute); adaugaInIstoric(istCO2, strCO2, intervalePierdute);
@@ -743,7 +819,9 @@ void loop() {
           adaugaInIstoric(istTemp, strTemp, intervalePierdute); adaugaInIstoric(istUmid, strUmid, intervalePierdute);
           adaugaInIstoric(istPM1, strPM1, intervalePierdute); adaugaInIstoric(istPM4, strPM4, intervalePierdute); adaugaInIstoric(istPM10, strPM10, intervalePierdute);
 
-          sumPM1 = 0; sumPM25 = 0; sumPM4 = 0; sumPM10 = 0; sumTemp = 0; sumUmid = 0; sumVOC = 0; sumNOx = 0; sumCO2 = 0; countAveraging = 0; countVOC = 0; countNOx = 0;
+          // Resetam tot la zero
+          sumPM1 = 0; sumPM25 = 0; sumPM4 = 0; sumPM10 = 0; sumTemp = 0; sumUmid = 0; sumVOC = 0; sumNOx = 0; sumCO2 = 0; 
+          countPM = 0; countCO2 = 0; countClima = 0; countVOC = 0; countNOx = 0;
 
           if (WiFi.status() == WL_CONNECTED && Firebase.ready() && firebaseGata) { 
               FirebaseJson jsonIstoric; 
