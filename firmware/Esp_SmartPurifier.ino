@@ -1,20 +1,31 @@
 ﻿#include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiMulti.h>
 #include <Firebase_ESP_Client.h>
 #include <Adafruit_NeoPixel.h>
 #include <Wire.h>
-#include <U8g2lib.h>
 #include <SensirionI2cSen66.h>
 #include <Preferences.h>
 #include "time.h"
 #include "esp_timer.h" 
 #include <esp_system.h> 
 
+// ==== LIBRARIILE OFICIALE ADAFRUIT PENTRU ECRAN ====
+#include <Adafruit_GFX.h>    
+#include <Adafruit_ST7789.h> 
+#include <SPI.h>
+
+// Fonturi HD pt Interfata
+#include <Fonts/FreeSans9pt7b.h>
+#include <Fonts/FreeSansBold12pt7b.h>
+#include <Fonts/FreeSansBold18pt7b.h>
+#include <Fonts/FreeSansBold24pt7b.h> 
+
 // Librarii auxiliare Firebase
 #include "addons/TokenHelper.h"
 #include "addons/RTDBHelper.h"
 
-// Librarii pentru Update prin WiFi si Watchdog
+// Librarii OTA si Watchdog
 #include <ESPmDNS.h>
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
@@ -22,31 +33,47 @@
 #include <math.h>
 
 // ================= DATELE FIREBASE =================
-#define WIFI_SSID "YOUR_WIFI_SSID"
-#define WIFI_PASSWORD "YOUR_WIFI_PASS"
 #define API_KEY "YOUR_FIREBASE_API_KEY"
 #define DATABASE_URL "https://YOUR_PROJECT-default-rtdb.firebasedatabase.app/" 
 // ===================================================
 
-int OFFSET_X = 2; 
-int OFFSET_Y = 0;  
+#define USER_EMAIL "YOUR_DEVICE_EMAIL"
+#define USER_PASSWORD "YOUR_PASSWORD"
 
 const char* TZ_INFO    = "EET-2EEST,M3.5.0/3,M10.5.0/4";
 const char* ntpServer  = "pool.ntp.org";
 
-// Pini Hardware
+// Pini Hardware S3
 #define I2C_SDA 8
 #define I2C_SCL 9
 #define PIN_LED_RGB 38
 #define PIN_FAN_PWM 1  
 #define PIN_FAN_RPM 2  
+#define PIN_TFT_BL 16  
+
+// Pinii Magistralei SPI liberi pt OPI PSRAM
+#define TFT_SCLK 6
+#define TFT_MOSI 5
+#define TFT_CS   4  
+#define TFT_DC   7  
+#define TFT_RST  15  
 
 #define PWM_FRECVENTA 25000 
 #define PWM_REZOLUTIE 8 
 
-U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R2, /* reset=*/ U8X8_PIN_NONE);
+// Culori Custom (Format RGB565)
+#define C_BG        0x0821  
+#define C_PANEL     0x18E3  
+#define C_PANEL_B   0x3186  
+#define C_TEXT_DIM  0x8410  
+#define C_SKYBLUE   0x34BF  
+
+Adafruit_ST7789 tft = Adafruit_ST7789(&SPI, TFT_CS, TFT_DC, TFT_RST);
 Adafruit_NeoPixel rgbLed(1, PIN_LED_RGB, NEO_GRB + NEO_KHZ800);
 SensirionI2cSen66 sen66;
+
+WiFiMulti wifiMulti;
+
 
 FirebaseData fbdoScriere, fbdoCitire;
 FirebaseAuth auth;
@@ -55,6 +82,11 @@ bool firebaseGata = false;
 
 Preferences stocare;
 
+bool isAutoMode = false;
+unsigned long timpUltimaSchimbareAuto = 0;
+int vitezaAutoCurenta = 0;
+bool eraAutoInainte = false;
+
 bool istoricRecuperat = false;
 bool bootLogSent = false; 
 int lastSavedMin = -1;
@@ -62,14 +94,16 @@ String lastArchivedDateStr = "";
 long lastIstoricSaveTime = 0; 
 unsigned long tAntSenzor = 0, tAntFB = 0, tAntEcran = 0, tAntLive = 0, tAntFading = 0, tAntRpm = 0, tAntWifi = 0, tAntVocSave = 0;
 
-// WATCHDOG SI WARM-UP SENZOR
 unsigned long tUltimaCitireReusita = 0; 
-unsigned long tSenzorStart = 0; // Inregistreaza cand a pornit fizic masuratoarea
+unsigned long tSenzorStart = 0; 
 
-int paginaCurenta = 1;
 bool areDate = false;
+bool isNightMode = false; 
+bool nightModeApp = false; 
 
 int vitezaDinAplicatie = 0; 
+int luminozitateEcran = 100;
+int luminozitateLed = 150; // <-- MODIFICAT AICI: Variabila pentru luminozitate LED RGB
 int targetFanSpeed = 0;   
 int currentFanSpeed = 0;  
 int rpmReal = 0; 
@@ -77,18 +111,35 @@ bool modLiveRapid = false;
 
 float offsetTemperatura = -1.0;
 
-// =========================================================================
-// MAGIA DE DEBUG: MEMORIA RTC NO-INIT
-// =========================================================================
 RTC_NOINIT_ATTR char rtc_last_state[64]; 
 String motivRestart = ""; 
+
+// =========================================================================
+// VARIABILE PENTRU ANIMATIILE FLICKER-FREE (UI Dashboard)
+// =========================================================================
+bool forceFullRedraw = true;
+int old_co2 = -1, old_voc = -1, old_nox = -1;
+float old_pm25 = -1.0, old_temp = -99.0, old_umid = -1.0;
+int old_fan = -1, old_rpm = -1;
+String old_time = "", old_date = "";
+
+int16_t bx_co2, by_co2; uint16_t bw_co2, bh_co2;
+int16_t bx_pm, by_pm; uint16_t bw_pm, bh_pm;
+int16_t bx_voc, by_voc; uint16_t bw_voc, bh_voc;
+int16_t bx_nox, by_nox; uint16_t bw_nox, bh_nox;
+int16_t bx_temp, by_temp; uint16_t bw_temp, bh_temp;
+int16_t bx_umid, by_umid; uint16_t bw_umid, bh_umid;
+int16_t bx_fan, by_fan; uint16_t bw_fan, bh_fan;
+int16_t bx_rpm, by_rpm; uint16_t bw_rpm, bh_rpm;
+int16_t bx_time, by_time; uint16_t bw_time, bh_time;
+int16_t bx_date, by_date; uint16_t bw_date, bh_date;
+
+int cur_co2 = -1, cur_pm = -1, cur_voc = -1, cur_nox = -1, cur_temp = -1, cur_umid = -1;
 
 void updateState(const char* state) {
   strncpy(rtc_last_state, state, sizeof(rtc_last_state) - 1);
   rtc_last_state[sizeof(rtc_last_state) - 1] = '\0';
-  if (Serial) { 
-      Serial.print(">> Executing: "); Serial.println(rtc_last_state);
-  }
+  if (Serial) { Serial.print(">> Executing: "); Serial.println(rtc_last_state); }
 }
 
 String getResetReasonString() {
@@ -107,9 +158,7 @@ String getResetReasonString() {
 }
 
 void clearI2CBus(int sdaPin, int sclPin) {
-  pinMode(sdaPin, INPUT_PULLUP);
-  pinMode(sclPin, INPUT_PULLUP);
-  delay(10);
+  pinMode(sdaPin, INPUT_PULLUP); pinMode(sclPin, INPUT_PULLUP); delay(10);
   if (digitalRead(sdaPin) == LOW) {
     if (Serial) Serial.println("I2C Bus Blocat! Incerc deblocarea...");
     pinMode(sclPin, OUTPUT);
@@ -129,8 +178,7 @@ String getPaddedHistory(String istoric, time_t tNow, long lastSave) {
     if (intervalePierdute > 288) intervalePierdute = 288;
     String rezultat = istoric;
     for(int i = 0; i < intervalePierdute; i++) {
-        if (rezultat != "") rezultat += ",";
-        rezultat += "-999";
+        if (rezultat != "") rezultat += ","; rezultat += "-999";
     }
     int numarVirgule = 0;
     for (int i = 0; i < rezultat.length(); i++) { if (rezultat[i] == ',') numarVirgule++; }
@@ -150,28 +198,24 @@ String extrageArhivaIeri(String dateCurente, int puncteAzi) {
         for(int i=1; i<288; i++) gol += ",-999";
         return gol;
     }
-    
     int currentIndex = 0;
     for (int i = 0; i < puncteIeriRamase; i++) {
         int nextComma = dateCurente.indexOf(',', currentIndex);
         if (nextComma == -1) { currentIndex = dateCurente.length() + 1; break; }
         currentIndex = nextComma + 1;
     }
-    
     String valoriIeri = dateCurente;
     if (currentIndex > 0 && currentIndex <= dateCurente.length()) { 
         valoriIeri = dateCurente.substring(0, currentIndex - 1); 
     }
-    
     String arhivaReconstruita = "";
     for (int i = 0; i < puncteAzi; i++) { arhivaReconstruita += "-999,"; }
     arhivaReconstruita += valoriIeri;
-    
     return arhivaReconstruita;
 }
 
 // =========================================================================
-// FILTRUL ORIGINAL RPM (Digital Low-Pass Filter)
+// FILTRUL ORIGINAL RPM (Software Timer + Median Array)
 // =========================================================================
 esp_timer_handle_t tacho_timer;
 volatile unsigned int validPulseCount = 0;
@@ -192,21 +236,12 @@ void IRAM_ATTR tachoPoll(void* arg) {
   else if (highSamples >= 4 && tachoState == LOW) { tachoState = HIGH; }
 }
 
-bool isAutoMode = false;
-unsigned long timpUltimaSchimbareAuto = 0;
-int vitezaAutoCurenta = 0;
-bool eraAutoInainte = false;
-
-// Initializam gazele cu 65535 pt a declansa starea de "Init..." pe ecran si aplicatie
-float pm1=0, pm25=0, pm4=0, pm10=0, umiditate=0, temp=0, voc=65535, nox=65535;
+float pm1=-1, pm25=-1, pm4=-1, pm10=-1, umiditate=0, temp=0, voc=65535, nox=65535;
 uint16_t co2=0;
 
-// Variabile de Suma
 float sumPM1 = 0, sumPM25 = 0, sumPM4 = 0, sumPM10 = 0, sumTemp = 0, sumUmid = 0, sumVOC = 0, sumNOx = 0;
 unsigned long sumCO2 = 0;
-
-// Contoare INDEPENDENTE pentru fiecare tip de senzor
-int countPM = 0, countCO2 = 0, countClima = 0, countVOC = 0, countNOx = 0;
+int countPM = -1, countCO2 = 0, countClima = 0, countVOC = 0, countNOx = 0;
 
 String istPM25="", istCO2="", istVOC="", istNOx="", istTemp="", istUmid="", istPM1="", istPM4="", istPM10="";
 String jurnalErori = "";
@@ -216,7 +251,6 @@ void logSystem(String mesaj) {
   if (Serial) Serial.println(mesaj);
   if (!firebaseGata) return; 
   time_t now; time(&now);
-  
   String tsStr = (now < 1000000000) ? "999999999" : String(now); 
   String intrare = tsStr + "#" + mesaj;
   
@@ -251,80 +285,333 @@ void adaugaInIstoric(String &istoricActual, String valoareNoua, int puncteLipsa)
   }
 }
 
-// BUG 2 REPARAT: Ecranul OLED stie acum sa arate "Init..." in timpul warm-up-ului
-void deseneazaPagina(int pag) {
-  u8g2.clearBuffer(); u8g2.setFont(u8g2_font_ncenB08_tr); 
-  if (pag == 1) { 
-      u8g2.drawStr(OFFSET_X, OFFSET_Y + 12, "== SYSTEM STATUS =="); u8g2.setCursor(OFFSET_X, OFFSET_Y + 30); 
-      u8g2.print("Putere: "); u8g2.print(currentFanSpeed); u8g2.print("%"); 
-      if (isAutoMode) { u8g2.print(" (Auto)"); } else { u8g2.print(" (Man)"); }
-      u8g2.setCursor(OFFSET_X, OFFSET_Y + 45); u8g2.print("RPM Real: "); u8g2.print(rpmReal);
-  } else if (pag == 2) { 
-      u8g2.drawStr(OFFSET_X, OFFSET_Y + 12, "== PRAF (ug/m3) =="); 
-      u8g2.setCursor(OFFSET_X, OFFSET_Y + 30); u8g2.print("PM1: "); u8g2.print(pm1, 1);
-      u8g2.setCursor(OFFSET_X + 64, OFFSET_Y + 30); u8g2.print("PM2.5: "); u8g2.print(pm25, 1);
-      u8g2.setCursor(OFFSET_X, OFFSET_Y + 50); u8g2.print("PM4: "); u8g2.print(pm4, 1);
-      u8g2.setCursor(OFFSET_X + 64, OFFSET_Y + 50); u8g2.print("PM10: "); u8g2.print(pm10, 1);
-  } else if (pag == 3) { 
-      u8g2.drawStr(OFFSET_X, OFFSET_Y + 12, "== GAZE (ppm/idx) =="); 
+// =========================================================================
+// MOTOARE GRAFICE: Helperi culori, string-uri data si functii Flicker-Free
+// =========================================================================
+
+uint16_t getPmColor(float val) {
+    
+    if (val < 0.0) return ST77XX_WHITE;
+    if (val < 5.0) return ST77XX_GREEN;
+    if (val < 12.0) return ST77XX_YELLOW;
+    if (val < 35.0) return ST77XX_ORANGE;
+    return ST77XX_RED;
+}
+uint16_t getCo2Color(uint16_t val) {
+    if (val == 0 || val == 65535) return ST77XX_WHITE;
+    if (val < 800) return ST77XX_GREEN;
+    if (val < 1200) return ST77XX_YELLOW;
+    if (val < 1600) return ST77XX_ORANGE;
+    return ST77XX_RED;
+}
+uint16_t getVocColor(float val) {
+    if (val > 500) return ST77XX_WHITE;
+    if (val < 150) return ST77XX_GREEN;
+    if (val < 250) return ST77XX_YELLOW;
+    if (val < 400) return ST77XX_ORANGE;
+    return ST77XX_RED;
+}
+
+uint16_t getNoxColor(float val) {
+    if (val > 500) return ST77XX_WHITE;
+    if (val < 150) return ST77XX_GREEN;
+    if (val < 250) return ST77XX_YELLOW;
+    if (val < 400) return ST77XX_ORANGE;
+    return ST77XX_RED;
+}
+
+uint16_t getTempColor(float val) {
+    if (val == 0) return ST77XX_WHITE;
+    if (val < 18.0) return ST77XX_BLUE;     // Albastru rece
+    if (val < 22.0) return ST77XX_GREEN;    // Verde (confort)
+    if (val < 26.0) return ST77XX_YELLOW;   // Galben/Portocaliu cald
+    return ST77XX_RED;                      // Roșu fierbinte
+}
+
+uint16_t getHumidColor(float val) {
+    if (val == 0) return ST77XX_WHITE;
+    if (val < 25.0) return tft.color565(255, 128, 0);   // Portocaliu (foarte uscat)
+    if (val < 50.0) return tft.color565(0, 255, 0);     // Verde (confort)
+    if (val < 75.0) return tft.color565(0, 178, 255);   // Bleu (usor umed)
+    return tft.color565(0, 0, 255);                     // Albastru (foarte umed)
+}
+
+void drawUpdatingText(String text, int x, int y, const GFXfont *font, uint16_t color, int16_t &bx, int16_t &by, uint16_t &bw, uint16_t &bh) {
+    if (bw > 0) tft.fillRect(bx, by, bw, bh, C_PANEL); 
+    tft.setFont(font);
+    
+    int16_t x1, y1; uint16_t w, h;
+    tft.getTextBounds(text, x, y, &x1, &y1, &w, &h);
+    
+    bx = x1; by = y1; bw = w; bh = h; 
+    
+    tft.setTextColor(color);
+    tft.setCursor(x, y);
+    tft.print(text);
+}
+
+void drawUpdatingTextCentered(String text, int centerX, int y, const GFXfont *font, uint16_t color, int16_t &bx, int16_t &by, uint16_t &bw, uint16_t &bh) {
+    if (bw > 0) tft.fillRect(bx, by, bw, bh, C_PANEL); 
+    tft.setFont(font);
+    
+    int16_t x1, y1; uint16_t w, h;
+    tft.getTextBounds(text, 0, 0, &x1, &y1, &w, &h); 
+    
+    int startX = centerX - (w / 2); 
+    
+    tft.getTextBounds(text, startX, y, &x1, &y1, &w, &h); 
+    bx = x1; by = y1; bw = w; bh = h; 
+    
+    tft.setTextColor(color);
+    tft.setCursor(startX, y);
+    tft.print(text);
+}
+
+void drawSegmentedBar(int x, int y, int w, int h) {
+    int q = w / 4;
+    tft.fillRect(x, y, q, h, ST77XX_GREEN);
+    tft.fillRect(x+q, y, q, h, ST77XX_YELLOW);
+    tft.fillRect(x+2*q, y, q, h, ST77XX_ORANGE);
+    tft.fillRect(x+3*q, y, w - 3*q, h, ST77XX_RED);
+}
+
+void drawTempBar(int x, int y, int w, int h) {
+    int q = w / 4;
+    tft.fillRect(x, y, q, h, ST77XX_BLUE);
+    tft.fillRect(x+q, y, q, h, ST77XX_GREEN);
+    tft.fillRect(x+2*q, y, q, h, ST77XX_YELLOW);
+    tft.fillRect(x+3*q, y, w - 3*q, h, ST77XX_RED);
+}
+
+void drawHumidBar(int x, int y, int w, int h) {
+    int q = w / 4;
+    tft.fillRect(x, y, q, h, tft.color565(255, 128, 0)); //brown
+    tft.fillRect(x+q, y, q, h, tft.color565(0, 255, 0));  //green
+    tft.fillRect(x+2*q, y, q, h, tft.color565(0, 178, 255)); //light blue
+    tft.fillRect(x+3*q, y, w - 3*q, h, tft.color565(0, 0, 255));  //dark blue
+}
+
+void updateCursor(int x, int y, int w, int h, float val, float minV, float maxV, int &oldC) {
+    if (oldC >= 0) tft.fillRect(oldC, y - 4, 3, 3, C_PANEL); 
+    
+    float pct = (val - minV) / (maxV - minV);
+    if (pct < 0) pct = 0; if (pct > 1) pct = 1;
+    int cx = x + (int)(pct * (w - 3));
+    
+    tft.fillRect(cx, y - 4, 3, 3, ST77XX_WHITE); 
+    oldC = cx;
+}
+
+const char* getDayNameRo(int wday) {
+    switch(wday) {
+        case 0: return "Duminica";
+        case 1: return "Luni";
+        case 2: return "Marti";
+        case 3: return "Miercuri";
+        case 4: return "Joi";
+        case 5: return "Vineri";
+        case 6: return "Sambata";
+        default: return "";
+    }
+}
+
+const char* getMonthNameRo(int mon) {
+    switch(mon) {
+        case 0: return "Ian";
+        case 1: return "Feb";
+        case 2: return "Mar";
+        case 3: return "Apr";
+        case 4: return "Mai";
+        case 5: return "Iun";
+        case 6: return "Iul";
+        case 7: return "Aug";
+        case 8: return "Sep";
+        case 9: return "Oct";
+        case 10: return "Nov";
+        case 11: return "Dec";
+        default: return "";
+    }
+}
+
+void deseneazaDashboard() {
+  if (isNightMode) return;
+
+  if (forceFullRedraw) {
+      tft.fillScreen(C_BG);
+
+      tft.fillRoundRect(4, 4, 153, 76, 6, C_PANEL);
+      tft.drawRoundRect(4, 4, 153, 76, 6, C_PANEL_B);
+      tft.setFont(NULL); tft.setCursor(12, 10); tft.setTextColor(C_TEXT_DIM); tft.print("CO2");
+      drawSegmentedBar(12, 68, 137, 5);
+
+      tft.fillRoundRect(163, 4, 153, 76, 6, C_PANEL);
+      tft.drawRoundRect(163, 4, 153, 76, 6, C_PANEL_B);
+      tft.setFont(NULL); tft.setCursor(171, 10); tft.setTextColor(C_TEXT_DIM); tft.print("PM2.5");
+      drawSegmentedBar(171, 68, 137, 5);
+
+      tft.fillRoundRect(4, 86, 153, 76, 6, C_PANEL);
+      tft.drawRoundRect(4, 86, 153, 76, 6, C_PANEL_B);
+      tft.setFont(NULL); tft.setCursor(12, 92); tft.setTextColor(C_TEXT_DIM); tft.print("VOC");
+      tft.setFont(NULL); tft.setCursor(84, 92); tft.setTextColor(C_TEXT_DIM); tft.print("NOx");
+      drawSegmentedBar(12, 150, 65, 5); 
+      drawSegmentedBar(84, 150, 65, 5); 
+
+      tft.fillRoundRect(163, 86, 153, 76, 6, C_PANEL);
+      tft.drawRoundRect(163, 86, 153, 76, 6, C_PANEL_B);
+      tft.setFont(NULL); tft.setCursor(171, 92); tft.setTextColor(C_TEXT_DIM); tft.print("TEMP");
+      tft.setFont(NULL); tft.setCursor(243, 92); tft.setTextColor(C_TEXT_DIM); tft.print("UMID");
+      drawTempBar(171, 150, 65, 5); 
+      drawHumidBar(243, 150, 65, 5); 
+
+      tft.fillRoundRect(4, 168, 153, 68, 6, C_PANEL);
+      tft.drawRoundRect(4, 168, 153, 68, 6, C_PANEL_B);
+      tft.setFont(NULL); tft.setCursor(12, 174); tft.setTextColor(C_TEXT_DIM); tft.print("SISTEM");
+
+      tft.fillRoundRect(163, 168, 153, 68, 6, C_PANEL);
+      tft.drawRoundRect(163, 168, 153, 68, 6, C_PANEL_B);
       
-      u8g2.setCursor(OFFSET_X, OFFSET_Y + 30); 
-      if (co2 == 0) u8g2.print("CO2 : Init..."); else { u8g2.print("CO2 : "); u8g2.print(co2); }
+      forceFullRedraw = false;
       
-      u8g2.setCursor(OFFSET_X, OFFSET_Y + 45); 
-      if (voc > 500) u8g2.print("VOC : Init..."); else { u8g2.print("VOC : "); u8g2.print((int)voc); }
-      
-      u8g2.setCursor(OFFSET_X, OFFSET_Y + 60); 
-      if (nox > 500) u8g2.print("NOx : Init..."); else { u8g2.print("NOx : "); u8g2.print((int)nox); }
-  } else if (pag == 4) { 
-      u8g2.drawStr(OFFSET_X + 16, OFFSET_Y + 12, "== AMBIENTA =="); 
-      
-      u8g2.setCursor(OFFSET_X, OFFSET_Y + 30); 
-      if (temp == 0) u8g2.print("Temp: Init..."); else { u8g2.print("Temp: "); u8g2.print(temp, 1); u8g2.print(" C"); }
-      
-      u8g2.setCursor(OFFSET_X, OFFSET_Y + 45); 
-      if (umiditate == 0) u8g2.print("Umid: Init..."); else { u8g2.print("Umid: "); u8g2.print(umiditate, 1); u8g2.print(" %"); }
-      
-      struct tm timeinfo;
-      if (getLocalTime(&timeinfo)) { char timeStringBuff[10]; strftime(timeStringBuff, sizeof(timeStringBuff), "%H:%M", &timeinfo); u8g2.setCursor(OFFSET_X, OFFSET_Y + 60); u8g2.print("Ora: "); u8g2.print(timeStringBuff); } else { u8g2.setCursor(OFFSET_X, OFFSET_Y + 60); u8g2.print("Ora: Sync.."); }
+      old_co2 = -1; old_pm25 = -99.0; old_voc = -1; old_nox = -1; old_temp = -99.0; old_umid = -1.0; old_fan = -1; old_rpm = -1; old_time = ""; old_date = "";
+      bw_co2=0; bw_pm=0; bw_voc=0; bw_nox=0; bw_temp=0; bw_umid=0; bw_fan=0; bw_rpm=0; bw_time=0; bw_date=0;
+      cur_co2=-1; cur_pm=-1; cur_voc=-1; cur_nox=-1; cur_temp=-1; cur_umid=-1;
   }
-  u8g2.setFont(u8g2_font_ncenB08_tr);
-  if(pag == 1) u8g2.drawStr(OFFSET_X + 45, OFFSET_Y + 64, "O . . ."); else if(pag == 2) u8g2.drawStr(OFFSET_X + 45, OFFSET_Y + 64, ". O . ."); else if(pag == 3) u8g2.drawStr(OFFSET_X + 45, OFFSET_Y + 64, ". . O ."); else if(pag == 4) u8g2.drawStr(OFFSET_X + 45, OFFSET_Y + 64, ". . . O");
-  u8g2.sendBuffer(); 
+
+
+  if (co2 != old_co2) {
+      String vStr = (co2 == 0 || co2 == 65535) ? "Init" : String(co2);
+      drawUpdatingTextCentered(vStr, 80, 52, &FreeSansBold24pt7b, getCo2Color(co2), bx_co2, by_co2, bw_co2, bh_co2);
+      // Cursorul CO2 (Min: 400, Max: 2000)
+      updateCursor(12, 68, 137, 6, co2, 400, 2000, cur_co2);
+      old_co2 = co2;
+  }
+
+  float disp_pm25 = round(pm25 * 10.0) / 10.0;
+  if (disp_pm25 != old_pm25) {
+      String vStr = (disp_pm25 < 0.0 && !areDate) ? "Init" : String(disp_pm25, 1);
+      drawUpdatingTextCentered(vStr, 239, 52, &FreeSansBold24pt7b, getPmColor(disp_pm25), bx_pm, by_pm, bw_pm, bh_pm);
+      // Cursorul PM2.5 (Min: 0, Max: 80 - ajustează max dacă ai schimbat pragurile mult)
+      updateCursor(171, 68, 137, 6, disp_pm25, 0, 50, cur_pm);
+      old_pm25 = disp_pm25;
+  }
+
+  int disp_voc = (int)voc;
+  if (disp_voc != old_voc) {
+      String vStr = (disp_voc > 500) ? "Init" : String(disp_voc);
+      drawUpdatingTextCentered(vStr, 44, 138, &FreeSansBold18pt7b, getVocColor(disp_voc), bx_voc, by_voc, bw_voc, bh_voc);
+      // Cursorul VOC (Min: 0, Max: 500)
+      updateCursor(12, 150, 65, 6, disp_voc, 1, 500, cur_voc);
+      old_voc = disp_voc;
+  }
+  
+  int disp_nox = (int)nox;
+  if (disp_nox != old_nox) {
+      String vStr = (disp_nox > 500) ? "Init" : String(disp_nox);
+      // Folosim getVocColor și aici, sau poți crea un getNoxColor separat
+      drawUpdatingTextCentered(vStr, 116, 138, &FreeSansBold18pt7b, getNoxColor(disp_nox), bx_nox, by_nox, bw_nox, bh_nox);
+      updateCursor(84, 150, 65, 6, disp_nox, 1, 500, cur_nox);
+      old_nox = disp_nox;
+  }
+
+  float disp_temp = round(temp * 10.0) / 10.0;
+  if (disp_temp != old_temp) {
+      String vStr = (disp_temp == 0) ? "Init" : String(disp_temp, 1);
+      // MODIFICARE: Aici aplicăm culoarea dinamică în loc de culoarea statică
+      drawUpdatingTextCentered(vStr, 203, 138, &FreeSansBold18pt7b, getTempColor(disp_temp), bx_temp, by_temp, bw_temp, bh_temp);
+      // Cursorul Temp (Min: 15, Max: 35) - poți schimba limitele min/max pentru vizual
+      updateCursor(171, 150, 65, 6, disp_temp, 16, 30, cur_temp); 
+      old_temp = disp_temp;
+  }
+  
+  float disp_umid = round(umiditate * 10.0) / 10.0;
+  if (disp_umid != old_umid) {
+      String vStr = (disp_umid == 0) ? "Init" : String(disp_umid, 1);
+      // MODIFICARE: Aici aplicăm culoarea dinamică în loc de culoarea statică
+      drawUpdatingTextCentered(vStr, 275, 138, &FreeSansBold18pt7b, getHumidColor(disp_umid), bx_umid, by_umid, bw_umid, bh_umid);
+      // Cursorul Umiditate (Min: 20, Max: 80) - mapat mai realist pt interior
+      updateCursor(243, 150, 65, 6, disp_umid, 10, 90, cur_umid); 
+      old_umid = disp_umid;
+  }
+
+  if (currentFanSpeed != old_fan || rpmReal != old_rpm) {
+      String fanStr = String(currentFanSpeed) + "% " + (isAutoMode ? "(AUTO)" : "(MAN)");
+      drawUpdatingText(fanStr, 12, 205, &FreeSans9pt7b, ST77XX_WHITE, bx_fan, by_fan, bw_fan, bh_fan);
+      
+      String rpmStr = String(rpmReal) + " RPM";
+      drawUpdatingText(rpmStr, 12, 226, &FreeSans9pt7b, C_SKYBLUE, bx_rpm, by_rpm, bw_rpm, bh_rpm);
+      
+      old_fan = currentFanSpeed; old_rpm = rpmReal;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) { tft.fillCircle(146, 178, 3, ST77XX_GREEN); } else { tft.fillCircle(146, 178, 3, ST77XX_RED); }
+
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) { 
+      char timeStringBuff[10]; strftime(timeStringBuff, sizeof(timeStringBuff), "%H:%M", &timeinfo); 
+      String tStr = String(timeStringBuff);
+      
+      String dStr = String(timeinfo.tm_mday) + " " + String(getMonthNameRo(timeinfo.tm_mon));
+      String dayStr = String(getDayNameRo(timeinfo.tm_wday));
+      String fulldateStr = dayStr + ", " + dStr;
+
+      if (tStr != old_time) {
+          drawUpdatingTextCentered(tStr, 238, 208, &FreeSansBold24pt7b, ST77XX_WHITE, bx_time, by_time, bw_time, bh_time);
+          old_time = tStr;
+      }
+      if (fulldateStr != old_date) {
+          drawUpdatingTextCentered(fulldateStr, 239, 230, &FreeSans9pt7b, C_TEXT_DIM, bx_date, by_date, bw_date, bh_date);
+          old_date = fulldateStr;
+      }
+  } else {
+      if (old_time != "Sync..") {
+          drawUpdatingTextCentered("Sync..", 239, 208, &FreeSansBold24pt7b, ST77XX_WHITE, bx_time, by_time, bw_time, bh_time);
+          old_time = "Sync..";
+      }
+  }
 }
 
 void setup() {
   Serial.begin(115200);
-  
-  Serial.setTxTimeoutMs(0); 
   
   if (esp_reset_reason() == ESP_RST_POWERON || esp_reset_reason() == ESP_RST_BROWNOUT) { 
       strcpy(rtc_last_state, "Sistem_Pornit_Priza"); 
   }
   motivRestart = getResetReasonString();
 
+  Serial.println("[1/7] Rezervare memorie stringuri...");
   istPM25.reserve(1500); istCO2.reserve(1500); istVOC.reserve(1500);
   istNOx.reserve(1500); istTemp.reserve(1500); istUmid.reserve(1500);
   istPM1.reserve(1500); istPM4.reserve(1500); istPM10.reserve(1500);
   jurnalErori.reserve(2000);
   
+  Serial.println("[2/7] Setup PWM si Ventilatoare...");
   ledcAttach(PIN_FAN_PWM, PWM_FRECVENTA, PWM_REZOLUTIE); ledcWrite(PIN_FAN_PWM, 0); 
   
-  pinMode(PIN_FAN_RPM, INPUT_PULLUP); 
-  const esp_timer_create_args_t tacho_timer_args = { .callback = &tachoPoll, .name = "tacho_poll" };
-  esp_timer_create(&tacho_timer_args, &tacho_timer); 
-  esp_timer_start_periodic(tacho_timer, 250); 
+  ledcAttach(PIN_TFT_BL, 5000, 8);
+  ledcWrite(PIN_TFT_BL, 255);
   
+  Serial.println("[3/7] Pornire Ecran TFT Landscape (Hardware SPI)...");
+  SPI.begin(TFT_SCLK, -1, TFT_MOSI, -1); 
+  tft.init(240, 320);
+  tft.setRotation(3); 
+  
+  tft.fillScreen(C_BG);
+  tft.setFont(&FreeSansBold24pt7b);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(50, 90);
+  tft.print("Booting...");
+
+  Serial.println("[4/7] Curatare si Pornire Magistrala I2C...");
   clearI2CBus(I2C_SDA, I2C_SCL);
   Wire.begin(I2C_SDA, I2C_SCL); 
   Wire.setTimeout(1000); 
 
+  Serial.println("[5/7] LED RGB si Flash Memory...");
   rgbLed.begin(); rgbLed.setBrightness(150); rgbLed.setPixelColor(0, rgbLed.Color(0, 0, 255)); rgbLed.show();
-  u8g2.begin(); u8g2.clearBuffer(); u8g2.setFont(u8g2_font_ncenB08_tr); u8g2.drawStr(OFFSET_X, OFFSET_Y + 15, "Pornire Sistem..."); u8g2.sendBuffer();
-
   stocare.begin("smart_air", false);
   offsetTemperatura = stocare.getFloat("tempOffset", 0.0);
 
+  Serial.println("[6/7] Initializez Senzorul SEN66...");
   sen66.begin(Wire, 0x6B); 
   sen66.deviceReset(); 
   delay(1200); 
@@ -345,10 +632,26 @@ void setup() {
   sen66.setTemperatureOffsetParameters((int16_t)(offsetTemperatura * 200), 0, 0, 0);
   delay(20); 
 
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD); WiFi.setSleep(false); 
-  
-  int conectareTries = 0;
-  while (WiFi.status() != WL_CONNECTED && conectareTries < 15) { delay(500); conectareTries++; }
+  Serial.println("[7/7] Adaugare retele WiFi cunoscute si conectare...");
+  WiFi.setSleep(false);
+
+    // =============================================
+    // LISTA RETELE WIFI CUNOSCUTE
+    // Adaugă/modifică după necesitate:
+  wifiMulti.addAP("YOUR_WIFI_SSID",       "YOUR_WIFI_PASS");   // Retea acasa
+  wifiMulti.addAP("YOUR_WIFI_SSID_2",      "YOUR_WIFI_PASS_2");    // Retea locatie 2
+  wifiMulti.addAP("YOUR_WIFI_SSID_3",       "YOUR_WIFI_PASS_3");     // Retea locatie 3
+    // =============================================
+
+int conectareTries = 0;
+while (wifiMulti.run() != WL_CONNECTED && conectareTries < 20) { 
+    delay(500); 
+    conectareTries++; 
+}
+if (WiFi.status() == WL_CONNECTED) {
+    Serial.print(">> Conectat la: "); Serial.println(WiFi.SSID());
+    Serial.print(">> IP: "); Serial.println(WiFi.localIP());
+}
 
   esp_task_wdt_config_t wdt_config = { .timeout_ms = 90000, .idle_core_mask = (1 << portNUM_PROCESSORS) - 1, .trigger_panic = true };
   if (esp_task_wdt_init(&wdt_config) == ESP_ERR_INVALID_STATE) esp_task_wdt_reconfigure(&wdt_config);
@@ -357,27 +660,36 @@ void setup() {
   ArduinoOTA.setHostname("SmartPurifier"); ArduinoOTA.setPassword("YOUR_OTA_PASSWORD");
   ArduinoOTA.onStart([]() { esp_task_wdt_delete(NULL); }); ArduinoOTA.begin();
 
-  delay(2000); 
+  Serial.println("[8/8] Pornire Tahometru Software si Intrare in Loop...");
+  pinMode(PIN_FAN_RPM, INPUT_PULLUP); 
+  const esp_timer_create_args_t tacho_timer_args = { .callback = &tachoPoll, .name = "tacho_poll" };
+  esp_timer_create(&tacho_timer_args, &tacho_timer); 
+  esp_timer_start_periodic(tacho_timer, 250); 
+  
+  forceFullRedraw = true;
+  delay(200); 
 }
 
 void loop() {
-  ArduinoOTA.handle();        
+  ArduinoOTA.handle(); 
   esp_task_wdt_reset(); 
 
   unsigned long t = millis(); 
   time_t tNow; time(&tNow);
   struct tm timeinfo; localtime_r(&tNow, &timeinfo);
 
-  if (WiFi.status() != WL_CONNECTED) { 
-      if (t - tAntWifi >= 30000) { 
-          tAntWifi = t;
-          if (!wifiAvertizat) { wifiAvertizat = true; updateState("Pierdut_WiFi"); }
-          WiFi.disconnect(); WiFi.reconnect();  
-      }
-  } 
+if (WiFi.status() != WL_CONNECTED) { 
+    if (t - tAntWifi >= 30000) { 
+        tAntWifi = t;
+        if (!wifiAvertizat) { wifiAvertizat = true; updateState("Pierdut_WiFi"); }
+        // wifiMulti.run() scanează automat toate rețelele cunoscute
+        // și se conectează la cea mai puternică disponibilă
+        wifiMulti.run();
+    }
+}
   else { 
       if (wifiAvertizat) { 
-          logSystem("Conexiune WiFi restabilita"); 
+          logSystem("WiFi restabilit pe: " + WiFi.SSID());
           wifiAvertizat = false; 
           
           fbdoScriere.clear();
@@ -397,18 +709,23 @@ void loop() {
           config.api_key = API_KEY; config.database_url = DATABASE_URL; 
           config.timeout.serverResponse = 3 * 1000; config.timeout.socketConnection = 3 * 1000; config.tcp_data_sending_retry = 1;        
 
-          if (Firebase.signUp(&config, &auth, "", "")) { 
-              config.token_status_callback = tokenStatusCallback; 
-              fbdoScriere.setBSSLBufferSize(2048, 1024); fbdoCitire.setBSSLBufferSize(2048, 1024);
-              Firebase.begin(&config, &auth); 
-              Firebase.reconnectWiFi(true); 
-              firebaseInitializat = true; firebaseGata = true;
-          }
+          // CODUL NOU (Autentificare cu Email/Parolă):
+auth.user.email = USER_EMAIL;
+auth.user.password = USER_PASSWORD;
+
+config.token_status_callback = tokenStatusCallback; 
+fbdoScriere.setBSSLBufferSize(2048, 1024); 
+fbdoCitire.setBSSLBufferSize(2048, 1024);
+
+Firebase.begin(&config, &auth); 
+Firebase.reconnectWiFi(true); 
+firebaseInitializat = true; 
+firebaseGata = true;
           updateState("Running_Loop");
       }
   }
 
-  // Calcul Turație Reală (1 secunda)
+  // Tahometru (1 secunda)
   if (t - tAntRpm >= 1000) {
       static unsigned int pulsuriTrecute[3] = {0, 0, 0}; static byte indexPuls = 0;
       
@@ -443,7 +760,6 @@ void loop() {
           tUltimaCitireReusita = t; 
           
           if (t_co2 != 65535) { 
-              // Calculam cat timp a trecut de la initierea hardware a senzorului
               unsigned long uptimeSenzor = t - tSenzorStart;
               
               bool prafValid = (uptimeSenzor >= 20000);
@@ -451,34 +767,26 @@ void loop() {
               bool climaValid = (uptimeSenzor >= 60000);
               bool gazeValid = (uptimeSenzor >= 60000);
 
-              // 1. PRAF (Dupa 20s)
               if (prafValid) {
                   pm1 = t_pm1; pm25 = t_pm25; pm4 = t_pm4; pm10 = t_pm10;
                   sumPM1 += pm1; sumPM25 += pm25; sumPM4 += pm4; sumPM10 += pm10;
                   countPM++;
               }
-
-              // 2. CO2 (Dupa 20s)
               if (co2Valid) {
                   co2 = t_co2;
                   sumCO2 += co2;
                   countCO2++;
               }
-
-              // 3. CLIMA (Dupa 60s)
               if (climaValid) {
                   temp = t_temp; umiditate = t_umid;
                   sumTemp += temp; sumUmid += umiditate;
                   countClima++;
               }
-
-              // 4. GAZE (Dupa 60s) - extra filtru tehnic de siguranță <= 500
               if (gazeValid) {
                   if (t_voc <= 500) { voc = t_voc; sumVOC += voc; countVOC++; }
                   if (t_nox <= 500) { nox = t_nox; sumNOx += nox; countNOx++; }
               }
               
-              // Marcam ca avem macar setul de baza functional (praf si co2) dupa 20s
               areDate = (prafValid || co2Valid || climaValid || gazeValid);
               
           } else {
@@ -501,7 +809,7 @@ void loop() {
       
       clearI2CBus(I2C_SDA, I2C_SCL);
       Wire.begin(I2C_SDA, I2C_SCL);
-      Wire.setTimeout(1000);
+      Wire.setTimeout(500);
       sen66.begin(Wire, 0x6B);
       sen66.deviceReset();
       
@@ -517,7 +825,7 @@ void loop() {
       
       sen66.startContinuousMeasurement();
       tReset = millis(); while(millis() - tReset < 50) { yield(); } 
-      tSenzorStart = millis(); // Resetam counterul de warm-up dupa un hardware restart
+      tSenzorStart = millis(); 
 
       sen66.setTemperatureOffsetParameters((int16_t)(offsetTemperatura * 200), 0, 0, 0);
       tReset = millis(); while(millis() - tReset < 20) { yield(); } 
@@ -546,14 +854,16 @@ void loop() {
   if (isAutoMode) {
       if (areDate) { 
           int vitezaDorita = 100;
-          if (pm1 <= 0.3 && pm25 <= 0.3 && pm4 <= 0.3 && pm10 <= 0.3) vitezaDorita = 25; 
-          else if (pm25 < 12.0) vitezaDorita = 35; 
-          else if (pm25 < 35.0) vitezaDorita = 60; 
+          if      (pm25 <= 0.5) vitezaDorita = 25;
+          else if (pm25 <= 2.0) vitezaDorita = 35;
+          else if (pm25 <= 6.0) vitezaDorita = 40;
+          else if (pm25 <= 12.0) vitezaDorita = 50;
+          else if (pm25 <= 30.0) vitezaDorita = 70;
           
           if (!eraAutoInainte) { vitezaAutoCurenta = vitezaDorita; timpUltimaSchimbareAuto = t; } 
           else {
               if (vitezaDorita > vitezaAutoCurenta) { vitezaAutoCurenta = vitezaDorita; timpUltimaSchimbareAuto = t; } 
-              else if (vitezaDorita < vitezaAutoCurenta) { if (t - timpUltimaSchimbareAuto >= 300000) { vitezaAutoCurenta = vitezaDorita; timpUltimaSchimbareAuto = t; } }
+              else if (vitezaDorita < vitezaAutoCurenta) { if (t - timpUltimaSchimbareAuto >= 600000) { vitezaAutoCurenta = vitezaDorita; timpUltimaSchimbareAuto = t; } }
           }
           eraAutoInainte = true; targetFanSpeed = vitezaAutoCurenta;
       }
@@ -567,38 +877,46 @@ void loop() {
       }
   }
 
-  if (t - tAntEcran >= 4000) {
+  // Bucla UI
+  if (t - tAntEcran >= 500) {
       tAntEcran = t; updateState("Control_Ecran");
-      bool nightModeApp = false;
-      
       esp_task_wdt_reset(); yield();
-      if (WiFi.status() == WL_CONNECTED && Firebase.ready() && firebaseGata) {
-          if (Firebase.RTDB.getBool(&fbdoCitire, "/SenzoriAer/setari/night_mode")) nightModeApp = fbdoCitire.boolData();
-      }
 
       if (nightModeApp) { 
-          u8g2.clearBuffer(); u8g2.sendBuffer(); rgbLed.clear(); rgbLed.show(); 
+          if (!isNightMode) {
+              isNightMode = true;
+              ledcWrite(PIN_TFT_BL, 0); 
+              rgbLed.clear(); rgbLed.show(); 
+          }
       } 
       else {
-          // BUG 1 REPARAT: LED-ul nu se va mai aprinde rosu eronat cand gaseste 65535 la pornire
-          if (pm25 >= 55 || co2 >= 1500 || (voc >= 400 && voc <= 500) || (nox >= 300 && nox <= 500)) 
+          if (isNightMode) {
+              isNightMode = false;
+              forceFullRedraw = true; 
+          }
+
+          ledcWrite(PIN_TFT_BL, map(luminozitateEcran, 0, 100, 0, 255));
+
+          if (pm25 >= 35 || co2 >= 1600 || (voc >= 400 && voc <= 500) || (nox >= 300 && nox <= 500)) 
               rgbLed.setPixelColor(0, rgbLed.Color(255, 0, 0)); 
-          else if (pm25 >= 35 || co2 >= 1000 || (voc >= 250 && voc <= 500) || (nox >= 150 && nox <= 500)) 
-              rgbLed.setPixelColor(0, rgbLed.Color(255, 100, 0)); 
-          else if (pm25 >= 12 || (co2 >= 800 && co2 != 0) || (voc >= 150 && voc <= 500) || (nox >= 20 && nox <= 500)) 
+          else if (pm25 >= 12 || co2 >= 1200 || (voc >= 250 && voc <= 500) || (nox >= 150 && nox <= 500)) 
+              rgbLed.setPixelColor(0, rgbLed.Color(255, 144, 0)); 
+          else if (pm25 >= 5 || (co2 >= 800 && co2 != 0) || (voc >= 150 && voc <= 500) || (nox >= 20 && nox <= 500)) 
               rgbLed.setPixelColor(0, rgbLed.Color(255, 255, 0)); 
           else 
               rgbLed.setPixelColor(0, rgbLed.Color(0, 255, 0)); 
           
+          // MODIFICAT AICI: Se aplica noua variabila de luminozitate a LED-ului
+          rgbLed.setBrightness(luminozitateLed);
           rgbLed.show(); 
-          paginaCurenta++; if(paginaCurenta > 4) paginaCurenta = 1; deseneazaPagina(paginaCurenta); 
+          deseneazaDashboard(); 
       }
       updateState("Running_Loop");
   }
 
   if (!istoricRecuperat) {
       if (WiFi.status() == WL_CONNECTED && Firebase.ready() && firebaseGata) {
-          u8g2.clearBuffer(); u8g2.drawStr(OFFSET_X, OFFSET_Y + 15, "Sincronizare DB..."); u8g2.sendBuffer();
+          tft.fillRect(4, 168, 153, 68, C_PANEL); tft.setFont(&FreeSans9pt7b); tft.setTextColor(ST77XX_ORANGE); tft.setCursor(12, 195); tft.print("Sync DB...");
           
           updateState("Sync_Jurnal"); 
           if (Firebase.RTDB.getString(&fbdoCitire, "/SenzoriAer/ErrorLog")) jurnalErori = fbdoCitire.stringData(); esp_task_wdt_reset(); yield();
@@ -615,33 +933,53 @@ void loop() {
           updateState("Sync_IstoricPM4"); if (Firebase.RTDB.getString(&fbdoCitire, "/SenzoriAer/Istoric_PM4")) istPM4 = fbdoCitire.stringData(); esp_task_wdt_reset(); yield();
           updateState("Sync_IstoricPM10"); if (Firebase.RTDB.getString(&fbdoCitire, "/SenzoriAer/Istoric_PM10")) istPM10 = fbdoCitire.stringData(); esp_task_wdt_reset(); yield();
           
-          istoricRecuperat = true; updateState("Running_Loop");
+          istoricRecuperat = true; forceFullRedraw = true; updateState("Running_Loop");
       }
       return; 
   }
 
   if (WiFi.status() == WL_CONNECTED && Firebase.ready() && firebaseGata && (t - tAntFB >= 2000)) {
-      tAntFB = t; updateState("Ascultare_Comenzi_FB");
-      
+      tAntFB = t; updateState("Ascultare_Setari_FB");
       esp_task_wdt_reset(); yield(); 
-      if (Firebase.RTDB.getBool(&fbdoCitire, "/SenzoriAer/setari/live_mode")) { modLiveRapid = fbdoCitire.boolData(); }
-
-      static int pasCitire = 0; 
       
-      if (pasCitire == 0) {
-          esp_task_wdt_reset(); yield(); 
-          if (Firebase.RTDB.getInt(&fbdoCitire, "/SenzoriAer/speed")) { vitezaDinAplicatie = fbdoCitire.intData(); }
-      }
-      else if (pasCitire == 1) {
-          esp_task_wdt_reset(); yield();
-          if (Firebase.RTDB.getFloat(&fbdoCitire, "/SenzoriAer/setari/temp_offset")) {
-              float newOffset = fbdoCitire.floatData();
+      if (Firebase.RTDB.getJSON(&fbdoCitire, "/SenzoriAer/setari")) {
+          FirebaseJson &json = fbdoCitire.jsonObject();
+          FirebaseJsonData jsonData;
+          
+          json.get(jsonData, "night_mode");
+          if (jsonData.success) nightModeApp = jsonData.boolValue;
+
+          json.get(jsonData, "live_mode");
+          if (jsonData.success) modLiveRapid = jsonData.boolValue;
+
+          json.get(jsonData, "luminozitate");
+          if (jsonData.success) {
+              luminozitateEcran = jsonData.intValue;
+              if (luminozitateEcran < 0) luminozitateEcran = 0;
+              if (luminozitateEcran > 100) luminozitateEcran = 100;
+          }
+          
+          // MODIFICAT AICI: Parsare variabila noua pentru LED
+          json.get(jsonData, "luminozitate_led");
+          if (jsonData.success) {
+              luminozitateLed = jsonData.intValue;
+              if (luminozitateLed < 0) luminozitateLed = 0;
+              if (luminozitateLed > 255) luminozitateLed = 255;
+          }
+
+          json.get(jsonData, "speed");
+          if (jsonData.success) {
+              vitezaDinAplicatie = jsonData.intValue;
+          }
+
+          json.get(jsonData, "temp_offset");
+          if (jsonData.success) {
+              float newOffset = jsonData.floatValue;
               static bool offsetFortatLaBoot = false;
 
               if (!offsetFortatLaBoot || fabs(newOffset - offsetTemperatura) > 0.05) { 
                   offsetTemperatura = newOffset;
                   stocare.putFloat("tempOffset", offsetTemperatura);
-                  
                   sen66.setTemperatureOffsetParameters((int16_t)(offsetTemperatura * 200), 0, 0, 0); 
                   
                   unsigned long tWait = millis();
@@ -650,58 +988,52 @@ void loop() {
                   if (offsetFortatLaBoot) {
                       logSystem("Offset Termic modificat cu succes: " + String(offsetTemperatura) + " C");
                   } else {
-                      if (Serial) Serial.println("Offset sincronizat cu Firebase la boot: " + String(offsetTemperatura) + " C");
+                      if (Serial) Serial.println("Offset sincronizat cu Firebase la boot.");
                   }
-                  
                   offsetFortatLaBoot = true;
               }
           }
-      }
-      else if (pasCitire == 2) {
-          esp_task_wdt_reset(); yield();
-          if (Firebase.RTDB.getJSON(&fbdoCitire, "/SenzoriAer/comenzi")) {
-              FirebaseJson &json = fbdoCitire.jsonObject();
-              FirebaseJsonData jsonData;
+
+          json.get(jsonData, "reset_calibrare");
+          if (jsonData.success && jsonData.boolValue == true) {
+              Firebase.RTDB.setBool(&fbdoScriere, "/SenzoriAer/setari/reset_calibrare", false);
+              tft.fillScreen(ST77XX_BLACK); tft.setCursor(30, 160); tft.setTextColor(ST77XX_RED); tft.print("RESET CALIBRARI");
+              logSystem("Comanda: Stergere Flash VOC si Restart");
+              stocare.remove("vocState"); delay(100); ESP.restart(); 
+          }
+
+          json.get(jsonData, "curatare");
+          if (jsonData.success && jsonData.boolValue == true) {
+              Firebase.RTDB.setBool(&fbdoScriere, "/SenzoriAer/setari/curatare", false);
+              tft.fillScreen(ST77XX_BLACK); tft.setCursor(30, 160); tft.setTextColor(ST77XX_ORANGE); tft.print("CURATARE SENZOR");
               
-              json.get(jsonData, "reset_calibrare");
-              if (jsonData.success && jsonData.boolValue == true) {
-                  Firebase.RTDB.setBool(&fbdoScriere, "/SenzoriAer/comenzi/reset_calibrare", false);
-                  u8g2.clearBuffer(); u8g2.setFont(u8g2_font_ncenB08_tr); u8g2.drawStr(OFFSET_X + 10, OFFSET_Y + 25, "RESET CALIBRARI"); u8g2.sendBuffer();
-                  logSystem("Comanda: Stergere Flash VOC si Restart");
-                  stocare.remove("vocState"); delay(1000); ESP.restart(); 
-              }
+              logSystem("Curatare SEN66 Inceputa..."); 
+              
+              sen66.stopMeasurement(); 
+              unsigned long tCuratareStop = millis();
+              while(millis() - tCuratareStop < 1500) { esp_task_wdt_reset(); yield(); }
+              
+              sen66.startFanCleaning(); 
+              unsigned long tCuratare = millis();
+              while(millis() - tCuratare < 10000) { ArduinoOTA.handle(); esp_task_wdt_reset(); yield(); delay(10); }
+              sen66.startContinuousMeasurement();
+              
+              unsigned long tWait = millis();
+              while(millis() - tWait < 50) { esp_task_wdt_reset(); yield(); }
+              
+              logSystem("Curatare SEN66 Finalizata.");
+              forceFullRedraw = true;
+          }
 
-              json.get(jsonData, "curatare");
-              if (jsonData.success && jsonData.boolValue == true) {
-                  Firebase.RTDB.setBool(&fbdoScriere, "/SenzoriAer/comenzi/curatare", false);
-                  u8g2.clearBuffer(); u8g2.setFont(u8g2_font_ncenB08_tr); u8g2.drawStr(OFFSET_X + 10, OFFSET_Y + 25, "CURATARE SENZOR"); u8g2.sendBuffer();
-                  
-                  logSystem("Curatare SEN66 Inceputa..."); 
-                  
-                  sen66.stopMeasurement(); 
-                  unsigned long tCuratareStop = millis();
-                  while(millis() - tCuratareStop < 1500) { esp_task_wdt_reset(); yield(); }
-                  
-                  sen66.startFanCleaning(); 
-                  unsigned long tCuratare = millis();
-                  while(millis() - tCuratare < 10000) { ArduinoOTA.handle(); esp_task_wdt_reset(); yield(); delay(10); }
-                  sen66.startContinuousMeasurement();
-                  
-                  unsigned long tWait = millis();
-                  while(millis() - tWait < 50) { esp_task_wdt_reset(); yield(); }
-                  
-                  logSystem("Curatare SEN66 Finalizata.");
-              }
-
-              json.get(jsonData, "restart");
-              if (jsonData.success && jsonData.boolValue == true) {
-                  Firebase.RTDB.setBool(&fbdoScriere, "/SenzoriAer/comenzi/restart", false); ESP.restart(); 
-              }
+          json.get(jsonData, "restart");
+          if (jsonData.success && jsonData.boolValue == true) {
+              Firebase.RTDB.setBool(&fbdoScriere, "/SenzoriAer/setari/restart", false); 
+              delay(100); 
+              ESP.restart(); 
           }
       }
       
-      pasCitire++; if (pasCitire > 2) pasCitire = 0;
-      esp_task_wdt_reset(); yield(); updateState("Running_Loop");
+      updateState("Running_Loop");
   }
 
   unsigned long intervalTrimitere = 10000; 
@@ -729,12 +1061,10 @@ void loop() {
           jsonLive.set("PM1", pm1); jsonLive.set("PM25", pm25); jsonLive.set("PM4", pm4); jsonLive.set("PM10", pm10); 
           jsonLive.set("Temperatura", temp); jsonLive.set("Umiditate", umiditate);
       }
-// Trimitem asincron, dar verificam rezultatul trimiterii (Daca bufferul/conexiunea da rateu)
+      
       if (!Firebase.RTDB.updateNodeAsync(&fbdoScriere, "/SenzoriAer", &jsonLive)) {
           String motivEroare = fbdoScriere.errorReason();
           Serial.println("⚠️ [AVERTISMENT] Pachet Live pierdut! Motiv: " + motivEroare);
-          
-          // Daca e o eroare de memorie RAM sau buffer plin a librariei, scriem si in jurnalul de Firebase (daca isi revine)
           if (motivEroare.indexOf("buffer") != -1 || motivEroare.indexOf("memory") != -1) {
               logSystem("Eroare buffer Live FB: " + motivEroare);
           }
@@ -759,13 +1089,13 @@ void loop() {
           }
       } else { eroriCuratateLaOra = false; }
 
-      char timeBuffToday[50]; strftime(timeBuffToday, sizeof(timeBuffToday), "%d_%m_%Y", &timeinfo); String todayStr = String(timeBuffToday);
+      char timeBuffToday[50]; strftime(timeBuffToday, sizeof(timeBuffToday), "%Y_%m_%d", &timeinfo); String todayStr = String(timeBuffToday);
 
       if (lastArchivedDateStr != "" && todayStr != lastArchivedDateStr && WiFi.status() == WL_CONNECTED && Firebase.ready() && firebaseGata) {
           updateState("Arhivare_Zilnica_FB");
           String nodBaza = "/SenzoriAer/Arhiva_Zilnica/" + lastArchivedDateStr; 
           
-          int puncteAzi = ((curentHour * 60 + curentMin) / 5) + 1;
+          int puncteAzi = (curentHour * 60 + curentMin) / 5;
           
           FirebaseJson jsonArhiva; 
           jsonArhiva.set("PM25", extrageArhivaIeri(getPaddedHistory(istPM25, tNow, lastIstoricSaveTime), puncteAzi)); 
@@ -780,7 +1110,7 @@ void loop() {
           lastArchivedDateStr = todayStr; 
           Firebase.RTDB.setStringAsync(&fbdoScriere, "/SenzoriAer/last_archived_date", todayStr);
           
-          if (curentHour == 0 && curentMin < 10) { logSystem("Arhiva pt " + nodBaza.substring(28) + " creata!"); } else { logSystem("Arhiva pt " + nodBaza.substring(28) + " refacuta!"); }
+          if (curentHour == 0 && curentMin < 5) { logSystem("Arhiva pentru " + nodBaza.substring(27) + " creata!"); } else { logSystem("Arhiva pentru " + nodBaza.substring(27) + " refacuta!"); }
           updateState("Running_Loop");
       } 
       else if (lastArchivedDateStr == "" && WiFi.status() == WL_CONNECTED && Firebase.ready() && firebaseGata) { lastArchivedDateStr = todayStr; Firebase.RTDB.setStringAsync(&fbdoScriere, "/SenzoriAer/last_archived_date", todayStr); }
@@ -793,7 +1123,6 @@ void loop() {
 
           String strPM25 = "-999", strCO2 = "-999", strVOC = "-999", strNOx = "-999", strTemp = "-999", strUmid = "-999", strPM1 = "-999", strPM4 = "-999", strPM10 = "-999";
 
-          // MEDII CALCULATE INDEPENDENT DOAR DACA AU TRECUT DE WARM-UP!
           if (countPM > 0) {
               strPM1 = String(sumPM1 / countPM, 1); 
               strPM25 = String(sumPM25 / countPM, 1); 
@@ -819,7 +1148,6 @@ void loop() {
           adaugaInIstoric(istTemp, strTemp, intervalePierdute); adaugaInIstoric(istUmid, strUmid, intervalePierdute);
           adaugaInIstoric(istPM1, strPM1, intervalePierdute); adaugaInIstoric(istPM4, strPM4, intervalePierdute); adaugaInIstoric(istPM10, strPM10, intervalePierdute);
 
-          // Resetam tot la zero
           sumPM1 = 0; sumPM25 = 0; sumPM4 = 0; sumPM10 = 0; sumTemp = 0; sumUmid = 0; sumVOC = 0; sumNOx = 0; sumCO2 = 0; 
           countPM = 0; countCO2 = 0; countClima = 0; countVOC = 0; countNOx = 0;
 
