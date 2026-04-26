@@ -71,7 +71,6 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.input.pointer.PointerEventPass
-import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -101,28 +100,28 @@ import java.time.LocalTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import kotlin.math.roundToInt
-import java.util.Locale
 
 // ================= ENUMERĂRI ȘI VARIABILE GLOBALE =================
 enum class IntervalTimp(val ore: Int, val puncte: Int) { ORE_4(4, 48), ORE_12(12, 144), ORE_24(24, 288) }
 val culoriDisponibile = listOf(0xFF007AFF.toInt() to "Albastru", 0xFF00E676.toInt() to "Verde", 0xFFFF9500.toInt() to "Portocaliu", 0xFFFF2D55.toInt() to "Roșu", 0xFFAF52DE.toInt() to "Mov")
-
 enum class TrendScheme { POLLUTANTS, TEMPERATURE, HUMIDITY }
 
 fun getMonthRoShort(month: Int) = arrayOf("", "ian", "feb", "mar", "apr", "mai", "iun", "iul", "aug", "sep", "oct", "nov", "dec")[month]
-fun getDayOfWeekRo(date: LocalDate): String = when(date.dayOfWeek) { DayOfWeek.MONDAY -> "Lu"; DayOfWeek.TUESDAY -> "Ma"; DayOfWeek.WEDNESDAY -> "Mi"; DayOfWeek.THURSDAY -> "Jo"; DayOfWeek.FRIDAY -> "Vi"; DayOfWeek.SATURDAY -> "Sâ"; DayOfWeek.SUNDAY -> "Du" }
+fun getDayOfWeekRo(date: LocalDate): String = when(date.dayOfWeek) {
+    DayOfWeek.MONDAY -> "Lu"; DayOfWeek.TUESDAY -> "Ma"; DayOfWeek.WEDNESDAY -> "Mi"
+    DayOfWeek.THURSDAY -> "Jo"; DayOfWeek.FRIDAY -> "Vi"; DayOfWeek.SATURDAY -> "Sâ"; DayOfWeek.SUNDAY -> "Du"
+}
 
 fun formatUptime(seconds: Long): String {
-    val days = seconds / 86400
-    val hours = (seconds % 86400) / 3600
-    val mins = (seconds % 3600) / 60
+    val days = seconds / 86400; val hours = (seconds % 86400) / 3600; val mins = (seconds % 3600) / 60
     return if (days > 0L) "${days}d ${hours}h" else if (hours > 0L) "${hours}h ${mins}m" else "${mins}m"
 }
 
+// FIX #7: isNullOrBlank() în loc de isNullOrEmpty() — acoperă și string-uri cu doar spații
 fun parseIstoric(data: String?, isIndex: Boolean = false): List<Float> {
-    if (data.isNullOrEmpty()) return emptyList()
-    return data.split(",").mapNotNull {
-        val v = it.toFloatOrNull()
+    if (data.isNullOrBlank()) return emptyList()
+    return data.trim().split(",").mapNotNull {
+        val v = it.trim().toFloatOrNull()
         if (v != null && isIndex && v > 1000f) -999f else v
     }
 }
@@ -155,31 +154,31 @@ fun getHumidColor(v: Float): Color {
 fun ascultaFirebase(db: DatabaseReference, child: String, type: Class<out Any>, onChange: (Any?) -> Unit): ValueEventListener {
     val listener = object : ValueEventListener {
         override fun onDataChange(snapshot: DataSnapshot) { onChange(snapshot.getValue(type)) }
-        override fun onCancelled(error: DatabaseError) { Log.e("Firebase", "Eroare: ${error.message}") }
+        override fun onCancelled(error: DatabaseError) { Log.e("Firebase", "Eroare $child: ${error.message}") }
     }
     db.child(child).addValueEventListener(listener)
     return listener
 }
 
-// ================= FUNCȚIE CALCUL TENDINȚĂ =================
+// ================= FIX #4: calculateTrend corectat =================
+// Pragul de 0.05f evita "flicker" de trend la valori aproape egale (ex: 22.3 vs 22.3)
 @Composable
 fun calculateTrend(currentRawValue: Float, updateTrigger: Long): Int {
-    val (lastValue, setLastValue) = remember { mutableFloatStateOf(currentRawValue) }
-    val (trend, setTrend) = remember { mutableIntStateOf(0) }
-
+    var lastValue by remember { mutableFloatStateOf(-1f) }
+    var trend by remember { mutableIntStateOf(0) }
     LaunchedEffect(updateTrigger) {
-        if (lastValue <= 0f && currentRawValue > 0f) {
-            setLastValue(currentRawValue)
-            setTrend(0)
+        if (lastValue < 0f) {
+            // Prima valoare reală — nu calculăm trend, doar salvăm
+            lastValue = currentRawValue
             return@LaunchedEffect
         }
         val diff = currentRawValue - lastValue
-        if (diff == 0f) {
-            setTrend(0)
-        } else {
-            setTrend(if (diff > 0) 1 else -1)
-            setLastValue(currentRawValue)
+        trend = when {
+            diff > 0.05f  ->  1
+            diff < -0.05f -> -1
+            else           ->  0
         }
+        lastValue = currentRawValue
     }
     return trend
 }
@@ -201,24 +200,20 @@ fun SliderInteligentCustom(
 ) {
     var canvasSize by remember { mutableStateOf(Size.Zero) }
     var latestValue by remember { mutableFloatStateOf(value) }
-
     val currentOnValueChangeFinished by rememberUpdatedState(onValueChangeFinished)
 
     val thumbRadius = 14.dp
     val thumbRadiusPx = with(LocalDensity.current) { thumbRadius.toPx() }
     val trackHeight = 8.dp
     val trackHeightPx = with(LocalDensity.current) { trackHeight.toPx() }
-
     val trackColor = if (isAuto) textSecondary.copy(alpha = 0.15f) else textSecondary.copy(alpha = 0.25f)
     val activeTrackColor = if (isAuto) Color.Gray.copy(alpha = 0.5f) else accentColor
-    val thumbColor = Color.White
 
     fun calculateValue(xOffset: Float): Float {
         val trackWidth = canvasSize.width - 2 * thumbRadiusPx
         val clampedX = (xOffset - thumbRadiusPx).coerceIn(0f, trackWidth)
         val pct = clampedX / trackWidth
         var newValue = valueRange.start + pct * (valueRange.endInclusive - valueRange.start)
-
         if (stepSize > 0f) {
             val steps = ((newValue - valueRange.start) / stepSize).roundToInt()
             newValue = valueRange.start + steps * stepSize
@@ -227,93 +222,45 @@ fun SliderInteligentCustom(
     }
 
     Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(48.dp)
-            .pointerInput(Unit) {
-                awaitEachGesture {
-                    val down = awaitFirstDown(requireUnconsumed = false)
-                    down.consume()
-                    onDragStateChange?.invoke(true)
-
-                    var currentX = down.position.x
-                    var newVal = calculateValue(currentX)
-                    latestValue = newVal
-                    onValueChange(newVal)
-
-                    val pointerId = down.id
-                    while (true) {
-                        val event = awaitPointerEvent(PointerEventPass.Main)
-                        val change = event.changes.firstOrNull { it.id == pointerId }
-                        if (change == null || !change.pressed) break
-                        change.consume()
-
-                        currentX = change.position.x
-                        newVal = calculateValue(currentX)
-                        latestValue = newVal
-                        onValueChange(newVal)
-                    }
-                    onDragStateChange?.invoke(false)
-                    currentOnValueChangeFinished(latestValue)
+        modifier = Modifier.fillMaxWidth().height(48.dp).pointerInput(Unit) {
+            awaitEachGesture {
+                val down = awaitFirstDown(requireUnconsumed = false)
+                down.consume()
+                onDragStateChange?.invoke(true)
+                var currentX = down.position.x
+                var newVal = calculateValue(currentX)
+                latestValue = newVal; onValueChange(newVal)
+                val pointerId = down.id
+                while (true) {
+                    val event = awaitPointerEvent(PointerEventPass.Main)
+                    val change = event.changes.firstOrNull { it.id == pointerId }
+                    if (change == null || !change.pressed) break
+                    change.consume()
+                    currentX = change.position.x
+                    newVal = calculateValue(currentX)
+                    latestValue = newVal; onValueChange(newVal)
                 }
+                onDragStateChange?.invoke(false)
+                currentOnValueChangeFinished(latestValue)
             }
+        }
     ) {
         Canvas(modifier = Modifier.fillMaxSize()) {
             canvasSize = size
             val trackWidth = size.width - 2 * thumbRadiusPx
             val yCenter = size.height / 2f
             val endX = size.width - thumbRadiusPx
-
-            drawLine(
-                color = trackColor,
-                start = Offset(thumbRadiusPx, yCenter),
-                end = Offset(endX, yCenter),
-                strokeWidth = trackHeightPx,
-                cap = StrokeCap.Round
-            )
-
+            drawLine(color = trackColor, start = Offset(thumbRadiusPx, yCenter), end = Offset(endX, yCenter), strokeWidth = trackHeightPx, cap = StrokeCap.Round)
             val pctCurent = ((value - valueRange.start) / (valueRange.endInclusive - valueRange.start)).coerceIn(0f, 1f)
             val activeEndX = thumbRadiusPx + pctCurent * trackWidth
-
-            if (pctCurent > 0f) {
-                drawLine(
-                    color = activeTrackColor,
-                    start = Offset(thumbRadiusPx, yCenter),
-                    end = Offset(activeEndX, yCenter),
-                    strokeWidth = trackHeightPx,
-                    cap = StrokeCap.Round
-                )
-            }
-
+            if (pctCurent > 0f) drawLine(color = activeTrackColor, start = Offset(thumbRadiusPx, yCenter), end = Offset(activeEndX, yCenter), strokeWidth = trackHeightPx, cap = StrokeCap.Round)
             if (hasHoverStopZone) {
                 val stopPctEnd = ((stopZoneRange.endInclusive - valueRange.start) / (valueRange.endInclusive - valueRange.start)).coerceIn(0f, 1f)
-                val stopEndX = thumbRadiusPx + stopPctEnd * trackWidth
-
-                drawLine(
-                    color = Color(0xFF6E6E73),
-                    start = Offset(thumbRadiusPx, yCenter),
-                    end = Offset(stopEndX, yCenter),
-                    strokeWidth = trackHeightPx,
-                    cap = StrokeCap.Round
-                )
+                drawLine(color = Color(0xFF6E6E73), start = Offset(thumbRadiusPx, yCenter), end = Offset(thumbRadiusPx + stopPctEnd * trackWidth, yCenter), strokeWidth = trackHeightPx, cap = StrokeCap.Round)
             }
-
-            drawCircle(
-                color = Color.Black.copy(alpha = 0.1f),
-                radius = thumbRadiusPx + 3f,
-                center = Offset(activeEndX, yCenter + 4f)
-            )
-            drawCircle(
-                color = thumbColor,
-                radius = thumbRadiusPx,
-                center = Offset(activeEndX, yCenter)
-            )
-            drawCircle(
-                color = Color(0xFFE5E5EA),
-                radius = thumbRadiusPx,
-                center = Offset(activeEndX, yCenter),
-                style = Stroke(width = 2f)
-            )
+            drawCircle(color = Color.Black.copy(alpha = 0.1f), radius = thumbRadiusPx + 3f, center = Offset(activeEndX, yCenter + 4f))
+            drawCircle(color = Color.White, radius = thumbRadiusPx, center = Offset(activeEndX, yCenter))
+            drawCircle(color = Color(0xFFE5E5EA), radius = thumbRadiusPx, center = Offset(activeEndX, yCenter), style = Stroke(width = 2f))
         }
     }
 }
@@ -331,51 +278,67 @@ class SmartPurifierService : Service() {
     private var eraOffline = false
     private var initLoadDone = false
 
-    private val activeListeners = mutableMapOf<DatabaseReference, ValueEventListener>()
+    // FIX #1: List în loc de Map — permite același listener pe mai multe refs fără suprascrierea cheii
+    private val activeListeners = mutableListOf<Pair<DatabaseReference, ValueEventListener>>()
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     override fun onBind(intent: Intent?): IBinder? = null
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+
+    // Helper intern — nu mai e nevoie de funcție separată, inline e mai clar
+    private fun ataseazaListener(ref: DatabaseReference, listener: ValueEventListener) {
+        ref.addValueEventListener(listener)
+        activeListeners.add(ref to listener) // add() în loc de put() — nu suprascrie
+    }
 
     override fun onCreate() {
         super.onCreate()
         val canalServiciu = NotificationChannel("SERVICIU_FUNDAL", "Rulare in fundal", NotificationManager.IMPORTANCE_MIN)
         getSystemService(NotificationManager::class.java).createNotificationChannel(canalServiciu)
 
-        // MODIFICARE AICI: Intent pentru deschiderea aplicației de pe notificarea permanentă
         val intentAplicatie = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
         }
         val pendingIntentAplicatie = android.app.PendingIntent.getActivity(
-            this, 0, intentAplicatie, android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+            this, 0, intentAplicatie,
+            android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
         )
-
         val notificarePermanenta = NotificationCompat.Builder(this, "SERVICIU_FUNDAL")
             .setContentTitle("Smart Purifier Activ")
             .setContentText("Aparatul iti monitorizeaza aerul in fundal.")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setContentIntent(pendingIntentAplicatie) // Setăm acțiunea de click pe notificare
+            .setContentIntent(pendingIntentAplicatie)
             .build()
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) { startForeground(1, notificarePermanenta, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC) } else { startForeground(1, notificarePermanenta) }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(1, notificarePermanenta, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        } else {
+            startForeground(1, notificarePermanenta)
+        }
 
         var notifPraf = true; var notifGaze = true; var notifOffline = true
         var lastUpdate = System.currentTimeMillis()
         var curentPm25 = 0f; var curentCo2 = 0
+        var curentVoc = 0f; var curentNox = 0f  // FIX #2: state local pentru VOC/NOx
         var nightModeStatus = false
-
-        fun ataseazaListener(ref: DatabaseReference, listener: ValueEventListener) {
-            ref.addValueEventListener(listener)
-            activeListeners[ref] = listener
-        }
-
-        ataseazaListener(dbRoot.child("app/notif_praf"), object: ValueEventListener { override fun onDataChange(s: DataSnapshot) { notifPraf = s.getValue(Boolean::class.java) ?: true }; override fun onCancelled(error: DatabaseError) {} })
-        ataseazaListener(dbRoot.child("app/notif_gaze"), object: ValueEventListener { override fun onDataChange(s: DataSnapshot) { notifGaze = s.getValue(Boolean::class.java) ?: true }; override fun onCancelled(error: DatabaseError) {} })
-        ataseazaListener(dbRoot.child("app/notif_offline"), object: ValueEventListener { override fun onDataChange(s: DataSnapshot) { notifOffline = s.getValue(Boolean::class.java) ?: true }; override fun onCancelled(error: DatabaseError) {} })
-        ataseazaListener(dbRoot.child("setari/night_mode"), object: ValueEventListener { override fun onDataChange(s: DataSnapshot) { nightModeStatus = s.getValue(Boolean::class.java) ?: false }; override fun onCancelled(error: DatabaseError) {} })
-
         val prefs = getSharedPreferences("AppPrefs", MODE_PRIVATE)
 
+        ataseazaListener(dbRoot.child("app/notif_praf"), object: ValueEventListener {
+            override fun onDataChange(s: DataSnapshot) { notifPraf = s.getValue(Boolean::class.java) ?: true }
+            override fun onCancelled(error: DatabaseError) {}
+        })
+        ataseazaListener(dbRoot.child("app/notif_gaze"), object: ValueEventListener {
+            override fun onDataChange(s: DataSnapshot) { notifGaze = s.getValue(Boolean::class.java) ?: true }
+            override fun onCancelled(error: DatabaseError) {}
+        })
+        ataseazaListener(dbRoot.child("app/notif_offline"), object: ValueEventListener {
+            override fun onDataChange(s: DataSnapshot) { notifOffline = s.getValue(Boolean::class.java) ?: true }
+            override fun onCancelled(error: DatabaseError) {}
+        })
+        ataseazaListener(dbRoot.child("setari/night_mode"), object: ValueEventListener {
+            override fun onDataChange(s: DataSnapshot) { nightModeStatus = s.getValue(Boolean::class.java) ?: false }
+            override fun onCancelled(error: DatabaseError) {}
+        })
         ataseazaListener(dbRoot.child("last_update"), object: ValueEventListener {
             override fun onDataChange(s: DataSnapshot) {
                 lastUpdate = s.getValue(Long::class.java) ?: System.currentTimeMillis()
@@ -384,89 +347,85 @@ class SmartPurifierService : Service() {
             }
             override fun onCancelled(error: DatabaseError) {}
         })
-
         ataseazaListener(dbRoot.child("PM25"), object: ValueEventListener {
             override fun onDataChange(s: DataSnapshot) {
                 curentPm25 = s.getValue(Double::class.java)?.toFloat() ?: 0f
                 updateWidget(this@SmartPurifierService, curentPm25, curentCo2)
-
                 val alertPm = prefs.getFloat("alertPm", 35f)
                 val notifFreq = prefs.getInt("notifFreqMins", 10) * 60000L
-
                 if (notifPraf && curentPm25 >= alertPm && (System.currentTimeMillis() - timpUltimaNotifPraf > notifFreq) && initLoadDone) {
-                    trimiteAlarma("⚠️ Alerta Praf", "Nivel ridicat de PM2.5: $curentPm25 µg/m³!")
+                    trimiteAlarma("⚠️ Alerta Praf", "Nivel ridicat de PM2.5: %.1f µg/m³!".format(curentPm25))
                     timpUltimaNotifPraf = System.currentTimeMillis()
                 }
             }
             override fun onCancelled(error: DatabaseError) {}
         })
 
-        val gasListener = object: ValueEventListener {
+        // FIX #2: Fiecare nod ascultat separat cu lambda proprie — s.key e garantat corect
+        fun checkGazAlert() {
+            if (!notifGaze || !initLoadDone) return
+            val alertCo2 = prefs.getFloat("alertCo2", 1500f).toInt()
+            val alertVoc = prefs.getFloat("alertVoc", 250f)
+            val alertNox = prefs.getFloat("alertNox", 150f)
+            val notifFreq = prefs.getInt("notifFreqMins", 10) * 60000L
+            if (System.currentTimeMillis() - timpUltimaNotifGaze <= notifFreq) return
+            val motiv = when {
+                curentCo2 >= alertCo2 -> "CO2 a ajuns la $curentCo2 ppm!"
+                curentVoc >= alertVoc -> "VOC a ajuns la nivelul ${curentVoc.toInt()}!"
+                curentNox >= alertNox -> "NOx a ajuns la nivelul ${curentNox.toInt()}!"
+                else -> return
+            }
+            trimiteAlarma("⚠️ Alertă Aerisire", motiv)
+            timpUltimaNotifGaze = System.currentTimeMillis()
+        }
+
+        ataseazaListener(dbRoot.child("CO2"), object: ValueEventListener {
             override fun onDataChange(s: DataSnapshot) {
-                var vocTemp = 0f; var noxTemp = 0f
-                if(s.key == "CO2") { curentCo2 = s.getValue(Int::class.java) ?: 0; updateWidget(this@SmartPurifierService, curentPm25, curentCo2) }
-                if(s.key == "VOC") vocTemp = s.getValue(Double::class.java)?.toFloat() ?: 0f
-                if(s.key == "NOx") noxTemp = s.getValue(Double::class.java)?.toFloat() ?: 0f
-
-                val vocV = if (vocTemp > 1000f) 0f else vocTemp
-                val noxV = if (noxTemp > 1000f) 0f else noxTemp
-
-                val alertCo2 = prefs.getFloat("alertCo2", 1500f).toInt()
-                val alertVoc = prefs.getFloat("alertVoc", 250f)
-                val alertNox = prefs.getFloat("alertNox", 150f)
-                val notifFreq = prefs.getInt("notifFreqMins", 10) * 60000L
-
-                if (notifGaze && (curentCo2 >= alertCo2 || vocV >= alertVoc || noxV >= alertNox) && (System.currentTimeMillis() - timpUltimaNotifGaze > notifFreq) && initLoadDone) {
-                    val motiv = when { curentCo2 >= alertCo2 -> "CO2 a ajuns la $curentCo2 ppm!"; vocV >= alertVoc -> "VOC a ajuns la nivelul ${vocV.toInt()}!"; else -> "NOx a ajuns la nivelul ${noxV.toInt()}!" }
-                    trimiteAlarma("⚠️ Alertă Aerisire", motiv)
-                    timpUltimaNotifGaze = System.currentTimeMillis()
-                }
+                curentCo2 = s.getValue(Int::class.java) ?: 0
+                updateWidget(this@SmartPurifierService, curentPm25, curentCo2)
+                checkGazAlert()
             }
             override fun onCancelled(error: DatabaseError) {}
-        }
-        ataseazaListener(dbRoot.child("CO2"), gasListener)
-        ataseazaListener(dbRoot.child("VOC"), gasListener)
-        ataseazaListener(dbRoot.child("NOx"), gasListener)
+        })
+        ataseazaListener(dbRoot.child("VOC"), object: ValueEventListener {
+            override fun onDataChange(s: DataSnapshot) {
+                curentVoc = (s.getValue(Double::class.java)?.toFloat() ?: 0f).let { if (it > 1000f) 0f else it }
+                checkGazAlert()
+            }
+            override fun onCancelled(error: DatabaseError) {}
+        })
+        ataseazaListener(dbRoot.child("NOx"), object: ValueEventListener {
+            override fun onDataChange(s: DataSnapshot) {
+                curentNox = (s.getValue(Double::class.java)?.toFloat() ?: 0f).let { if (it > 1000f) 0f else it }
+                checkGazAlert()
+            }
+            override fun onCancelled(error: DatabaseError) {}
+        })
 
         serviceScope.launch {
             var lastScheduleCheck = 0L
-            while(isActive) {
+            while (isActive) {
                 val currentTime = System.currentTimeMillis()
-
                 if (initLoadDone) {
                     val dif = (currentTime - lastUpdate) / 1000
-                    val esteOfflineAcum = dif >= 60
-                    if (esteOfflineAcum && !eraOffline && notifOffline) {
+                    if (dif >= 60 && !eraOffline && notifOffline) {
                         trimiteAlarma("⚠️ Dispozitiv Offline", "Purificatorul a pierdut conexiunea WiFi!")
                         eraOffline = true
                     }
                 }
-
                 if (currentTime - lastScheduleCheck > 60000) {
                     lastScheduleCheck = currentTime
                     val nightModeAuto = prefs.getBoolean("nightModeAuto", false)
-                    val startHr = prefs.getInt("nmStartHr", 23)
-                    val startMin = prefs.getInt("nmStartMin", 0)
-                    val endHr = prefs.getInt("nmEndHr", 7)
-                    val endMin = prefs.getInt("nmEndMin", 0)
-
                     if (nightModeAuto) {
+                        val startHr = prefs.getInt("nmStartHr", 23); val startMin = prefs.getInt("nmStartMin", 0)
+                        val endHr = prefs.getInt("nmEndHr", 7); val endMin = prefs.getInt("nmEndMin", 0)
                         val localTime = LocalTime.now()
                         val currentMinutes = localTime.hour * 60 + localTime.minute
-                        val startMinutes = startHr * 60 + startMin
-                        val endMinutes = endHr * 60 + endMin
-
-                        val shouldBeOn = if (startMinutes <= endMinutes) {
-                            currentMinutes in startMinutes until endMinutes
-                        } else {
-                            currentMinutes !in endMinutes until startMinutes
-                        }
-
-                        if (shouldBeOn && !nightModeStatus) {
-                            dbRoot.child("setari/night_mode").setValue(true)
-                        } else if (!shouldBeOn && nightModeStatus) {
-                            dbRoot.child("setari/night_mode").setValue(false)
-                        }
+                        val startMinutes = startHr * 60 + startMin; val endMinutes = endHr * 60 + endMin
+                        val shouldBeOn = if (startMinutes <= endMinutes) currentMinutes in startMinutes until endMinutes
+                        else currentMinutes !in endMinutes until startMinutes
+                        if (shouldBeOn && !nightModeStatus) dbRoot.child("setari/night_mode").setValue(true)
+                        else if (!shouldBeOn && nightModeStatus) dbRoot.child("setari/night_mode").setValue(false)
                     }
                 }
                 delay(2000)
@@ -477,6 +436,7 @@ class SmartPurifierService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         serviceScope.cancel()
+        // FIX #1: Acum remove funcționează corect pentru toate cele 3 instanțe gasListener
         activeListeners.forEach { (ref, listener) -> ref.removeEventListener(listener) }
         activeListeners.clear()
     }
@@ -485,19 +445,17 @@ class SmartPurifierService : Service() {
         val appWidgetManager = AppWidgetManager.getInstance(context)
         val componentName = ComponentName(context, SmartPurifierWidget::class.java)
         val remoteViews = RemoteViews(context.packageName, R.layout.widget_purificator)
-
-        // MODIFICARE AICI: Flags adăugate pentru a aduce aplicația în prim-plan corect
         val intent = Intent(context, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
         }
-        val pendingIntent = android.app.PendingIntent.getActivity(context, 0, intent, android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE)
-
+        val pendingIntent = android.app.PendingIntent.getActivity(
+            context, 0, intent,
+            android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+        )
         val pmColorInt = when { pm25 < 12 -> 0xFF00E676.toInt(); pm25 < 35 -> 0xFFFFEB3B.toInt(); pm25 < 55 -> 0xFFFF9800.toInt(); else -> 0xFFF44336.toInt() }
         val coColorInt = when { co2 < 800 -> 0xFF00E676.toInt(); co2 < 1000 -> 0xFFFFEB3B.toInt(); co2 < 1500 -> 0xFFFF9800.toInt(); else -> 0xFFF44336.toInt() }
-
-        val pmBitmap = createWidgetDial(value = pm25, max = 55f, label = "PM", valString = String.format(Locale.US, "%.0f", pm25), colorInt = pmColorInt)
+        val pmBitmap = createWidgetDial(value = pm25, max = 55f, label = "PM", valString = "%.0f".format(pm25), colorInt = pmColorInt)
         val co2Bitmap = createWidgetDial(value = (co2 - 400f).coerceAtLeast(0f), max = 1100f, label = "CO2", valString = co2.toString(), colorInt = coColorInt)
-
         remoteViews.setImageViewBitmap(R.id.iv_widget_pm, pmBitmap)
         remoteViews.setImageViewBitmap(R.id.iv_widget_co2, co2Bitmap)
         remoteViews.setOnClickPendingIntent(R.id.iv_widget_pm, pendingIntent)
@@ -510,44 +468,38 @@ class SmartPurifierService : Service() {
         val bitmap = androidx.core.graphics.createBitmap(size, size, android.graphics.Bitmap.Config.ARGB_8888)
         val canvas = android.graphics.Canvas(bitmap)
         val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
-
         val strokeW = 34f
         val rect = android.graphics.RectF(strokeW, strokeW, size - strokeW, size - strokeW - 45f)
-        paint.style = android.graphics.Paint.Style.STROKE; paint.strokeWidth = strokeW; paint.strokeCap = android.graphics.Paint.Cap.ROUND; paint.color = 0xFF333333.toInt()
+        paint.style = android.graphics.Paint.Style.STROKE; paint.strokeWidth = strokeW
+        paint.strokeCap = android.graphics.Paint.Cap.ROUND; paint.color = 0xFF333333.toInt()
         canvas.drawArc(rect, 135f, 270f, false, paint)
-
         paint.color = colorInt
-        val progressPercent = (value / max).coerceIn(0f, 1f)
-        val sweepAngle = progressPercent * 270f
+        val sweepAngle = (value / max).coerceIn(0f, 1f) * 270f
         if (sweepAngle > 0) canvas.drawArc(rect, 135f, sweepAngle, false, paint)
-
-        paint.style = android.graphics.Paint.Style.FILL; paint.color = android.graphics.Color.WHITE; paint.textSize = 55f; paint.textAlign = android.graphics.Paint.Align.CENTER; paint.typeface = android.graphics.Typeface.create(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD)
-        val textY = rect.centerY() - ((paint.descent() + paint.ascent()) / 2)
-        canvas.drawText(label, rect.centerX(), textY, paint)
+        paint.style = android.graphics.Paint.Style.FILL; paint.color = android.graphics.Color.WHITE
+        paint.textSize = 55f; paint.textAlign = android.graphics.Paint.Align.CENTER
+        paint.typeface = android.graphics.Typeface.create(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD)
+        canvas.drawText(label, rect.centerX(), rect.centerY() - ((paint.descent() + paint.ascent()) / 2), paint)
         paint.textSize = 65f
         canvas.drawText(valString, rect.centerX(), size.toFloat() - 5f, paint)
         return bitmap
     }
 
     private fun trimiteAlarma(titlu: String, mesaj: String) {
-        // MODIFICARE AICI: Intent pentru deschiderea aplicației la apăsarea notificării de alertă
         val intentAplicatie = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
         }
         val pendingIntentAplicatie = android.app.PendingIntent.getActivity(
-            this, System.currentTimeMillis().toInt(), intentAplicatie, android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+            this, System.currentTimeMillis().toInt(), intentAplicatie,
+            android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
         )
-
         if (ActivityCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) {
             val builder = NotificationCompat.Builder(this, "ALERTE_AER")
                 .setSmallIcon(android.R.drawable.ic_dialog_alert)
-                .setContentTitle(titlu)
-                .setContentText(mesaj)
+                .setContentTitle(titlu).setContentText(mesaj)
                 .setPriority(NotificationCompat.PRIORITY_HIGH)
-                .setAutoCancel(true)
-                .setContentIntent(pendingIntentAplicatie) // Setăm acțiunea
-
-            with(NotificationManagerCompat.from(this)) { notify(System.currentTimeMillis().toInt(), builder.build()) }
+                .setAutoCancel(true).setContentIntent(pendingIntentAplicatie)
+            NotificationManagerCompat.from(this).notify(System.currentTimeMillis().toInt(), builder.build())
         }
     }
 }
@@ -558,39 +510,26 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         try { FirebaseDatabase.getInstance().setPersistenceEnabled(true) } catch (_: Exception) {}
         val auth = FirebaseAuth.getInstance()
-
         if (auth.currentUser?.email != "YOUR_APP_EMAIL") {
             auth.signOut()
             auth.signInWithEmailAndPassword("YOUR_APP_EMAIL", "YOUR_PASSWORD")
                 .addOnCompleteListener { task ->
-                    if (task.isSuccessful) {
-                        pornireAplicatie()
-                    } else {
+                    if (task.isSuccessful) { pornireAplicatie() }
+                    else {
                         val mesajEroare = task.exception?.message ?: "Eroare necunoscută la rețea."
                         Log.e("Firebase", "Eroare autentificare: $mesajEroare")
-
-                        // În loc de ecran alb, afișăm EROAREA EXACTĂ pe ecran:
                         setContent {
                             MaterialTheme {
-                                Box(
-                                    modifier = Modifier.fillMaxSize().background(Color.White),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Text(
-                                        text = "Eroare Firebase:\n\n$mesajEroare\n\nVerifică adresa de email și parola în consola Firebase!",
-                                        color = Color.Red,
-                                        textAlign = TextAlign.Center,
-                                        fontWeight = FontWeight.Bold,
-                                        modifier = Modifier.padding(24.dp)
-                                    )
+                                Box(modifier = Modifier.fillMaxSize().background(Color.White), contentAlignment = Alignment.Center) {
+                                    Text("Eroare Firebase:\n\n$mesajEroare\n\nVerifică adresa de email și parola în consola Firebase!",
+                                        color = Color.Red, textAlign = TextAlign.Center, fontWeight = FontWeight.Bold,
+                                        modifier = Modifier.padding(24.dp))
                                 }
                             }
                         }
                     }
                 }
-        } else {
-            pornireAplicatie()
-        }
+        } else { pornireAplicatie() }
     }
 
     private fun pornireAplicatie() {
@@ -601,12 +540,9 @@ class MainActivity : ComponentActivity() {
                 ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
             }
         }
-
         val prefs = getSharedPreferences("AppPrefs", MODE_PRIVATE)
-
         if (prefs.getBoolean("runInBackground", true)) {
-            val intentService = Intent(this, SmartPurifierService::class.java)
-            startForegroundService(intentService)
+            startForegroundService(Intent(this, SmartPurifierService::class.java))
         }
         setContent { MaterialTheme { PurificatorAppMain() } }
     }
@@ -619,7 +555,8 @@ fun PurificatorAppMain() {
     val database = FirebaseDatabase.getInstance("https://YOUR_PROJECT-default-rtdb.firebasedatabase.app/").getReference("SenzoriAer")
     val prefs = context.getSharedPreferences("AppPrefs", Context.MODE_PRIVATE)
 
-    // Logica Live Mode Imbunatatita
+    // FIX #3: rememberCoroutineScope() în loc de CoroutineScope() manual — e legat de lifecycle composable
+    val coroutineScope = rememberCoroutineScope()
     val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
     val liveModeJob = remember { mutableStateOf<Job?>(null) }
 
@@ -627,14 +564,14 @@ fun PurificatorAppMain() {
         val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
             when (event) {
                 androidx.lifecycle.Lifecycle.Event.ON_START, androidx.lifecycle.Lifecycle.Event.ON_RESUME -> {
-                    liveModeJob.value?.cancel()
-                    liveModeJob.value = null
+                    liveModeJob.value?.cancel(); liveModeJob.value = null
                     database.child("setari/live_mode").setValue(true)
                 }
                 androidx.lifecycle.Lifecycle.Event.ON_STOP, androidx.lifecycle.Lifecycle.Event.ON_PAUSE -> {
                     if (!prefs.getBoolean("liveModePermanent", false)) {
                         liveModeJob.value?.cancel()
-                        liveModeJob.value = CoroutineScope(Dispatchers.IO).launch {
+                        // FIX #3: coroutineScope e acum legat de composable lifecycle
+                        liveModeJob.value = coroutineScope.launch {
                             delay(10000)
                             database.child("setari/live_mode").setValue(false)
                         }
@@ -651,7 +588,6 @@ fun PurificatorAppMain() {
     val (accentColor, setAccentColor) = remember { mutableStateOf(Color(prefs.getInt("themeColor", 0xFF007AFF.toInt()))) }
     val (tipGrafic, setTipGrafic) = remember { mutableIntStateOf(prefs.getInt("tipGrafic", 0)) }
     val (runInBackground, setRunInBackground) = remember { mutableStateOf(prefs.getBoolean("runInBackground", true)) }
-
     val (categoryOrder, onOrderChange) = remember { mutableStateOf((prefs.getString("catOrder", "0,1,2") ?: "0,1,2").split(",").mapNotNull { it.toIntOrNull() }) }
 
     val bgMain = if (isDarkMode) Color(0xFF000000) else Color(0xFFF2F2F7)
@@ -678,7 +614,7 @@ fun PurificatorAppMain() {
     val (telemetrieUptime, setTelemetrieUptime) = remember { mutableLongStateOf(0L) }
     val (tempOffsetServer, setTempOffsetServer) = remember { mutableFloatStateOf(0f) }
     val (luminozitateServer, setLuminozitateServer) = remember { mutableIntStateOf(100) }
-    val (luminozitateLedServer, setLuminozitateLedServer) = remember { mutableIntStateOf(150) } // NEW: LED Brightness state
+    val (luminozitateLedServer, setLuminozitateLedServer) = remember { mutableIntStateOf(150) }
 
     val (nightModeApp, setNightModeApp) = remember { mutableStateOf(false) }
     val (liveModeServer, setLiveModeServer) = remember { mutableStateOf(false) }
@@ -693,10 +629,14 @@ fun PurificatorAppMain() {
     val (nox, setNox) = remember { mutableFloatStateOf(0f) }; val (temp, setTemp) = remember { mutableFloatStateOf(0f) }
     val (umiditate, setUmiditate) = remember { mutableFloatStateOf(0f) }
 
-    val (istoricPM1, setIstoricPM1) = remember { mutableStateOf<List<Float>>(emptyList()) }; val (istoricPM25, setIstoricPM25) = remember { mutableStateOf<List<Float>>(emptyList()) }
-    val (istoricPM4, setIstoricPM4) = remember { mutableStateOf<List<Float>>(emptyList()) }; val (istoricPM10, setIstoricPM10) = remember { mutableStateOf<List<Float>>(emptyList()) }
-    val (istoricCO2, setIstoricCO2) = remember { mutableStateOf<List<Float>>(emptyList()) }; val (istoricVOC, setIstoricVOC) = remember { mutableStateOf<List<Float>>(emptyList()) }
-    val (istoricNOx, setIstoricNOx) = remember { mutableStateOf<List<Float>>(emptyList()) }; val (istoricTemp, setIstoricTemp) = remember { mutableStateOf<List<Float>>(emptyList()) }
+    val (istoricPM1, setIstoricPM1) = remember { mutableStateOf<List<Float>>(emptyList()) }
+    val (istoricPM25, setIstoricPM25) = remember { mutableStateOf<List<Float>>(emptyList()) }
+    val (istoricPM4, setIstoricPM4) = remember { mutableStateOf<List<Float>>(emptyList()) }
+    val (istoricPM10, setIstoricPM10) = remember { mutableStateOf<List<Float>>(emptyList()) }
+    val (istoricCO2, setIstoricCO2) = remember { mutableStateOf<List<Float>>(emptyList()) }
+    val (istoricVOC, setIstoricVOC) = remember { mutableStateOf<List<Float>>(emptyList()) }
+    val (istoricNOx, setIstoricNOx) = remember { mutableStateOf<List<Float>>(emptyList()) }
+    val (istoricTemp, setIstoricTemp) = remember { mutableStateOf<List<Float>>(emptyList()) }
     val (istoricUmid, setIstoricUmid) = remember { mutableStateOf<List<Float>>(emptyList()) }
 
     LaunchedEffect(ultimulUpdateServer, initLoadDone) {
@@ -708,7 +648,6 @@ fun PurificatorAppMain() {
 
     DisposableEffect(Unit) {
         val activeListeners = mutableListOf<Pair<String, ValueEventListener>>()
-
         fun asculta(child: String, type: Class<out Any>, onChange: (Any?) -> Unit) {
             val listener = ascultaFirebase(database, child, type, onChange)
             activeListeners.add(child to listener)
@@ -717,7 +656,8 @@ fun PurificatorAppMain() {
         asculta("last_update", Long::class.java) { (it as? Long)?.let { v -> setUltimulUpdateServer(v); setInitLoadDone(true) } }
         asculta("last_history_time", Long::class.java) { (it as? Long)?.let { v -> setLastHistoryTimeUnix(v) } }
         asculta("RPM", Int::class.java) { (it as? Int)?.let { v -> setRpmServer(v) } }
-        asculta("setari/speed", Float::class.java) { (it as? Float)?.let { v -> setSpeedControlServer(v) } }
+        // FIX #5: speed e scris ca Int în Firebase, citit ca Int și convertit la Float
+        asculta("setari/speed", Int::class.java) { (it as? Int)?.let { v -> setSpeedControlServer(v.toFloat()) } }
         asculta("ProcentVentilator", Int::class.java) { (it as? Int)?.let { v -> setProcentVentilatorServer(v) } }
         asculta("Telemetrie_RAM_Liber", Int::class.java) { (it as? Int)?.let { v -> setTelemetrieRam(v) } }
         asculta("Telemetrie_Temp_Core", Double::class.java) { (it as? Double)?.let { v -> setTelemetrieTemp(v.toFloat()) } }
@@ -725,7 +665,7 @@ fun PurificatorAppMain() {
         asculta("Telemetrie_Uptime_Sec", Long::class.java) { (it as? Long)?.let { v -> setTelemetrieUptime(v) } }
         asculta("Setari_Offset_Temp", Double::class.java) { (it as? Double)?.let { v -> setTempOffsetServer(v.toFloat()) } }
         asculta("setari/luminozitate", Int::class.java) { (it as? Int)?.let { v -> setLuminozitateServer(v) } }
-        asculta("setari/luminozitate_led", Int::class.java) { (it as? Int)?.let { v -> setLuminozitateLedServer(v) } } // NEW: Listen LED brightness
+        asculta("setari/luminozitate_led", Int::class.java) { (it as? Int)?.let { v -> setLuminozitateLedServer(v) } }
         asculta("setari/night_mode", Boolean::class.java) { (it as? Boolean)?.let { v -> setNightModeApp(v) } }
         asculta("setari/live_mode", Boolean::class.java) { (it as? Boolean)?.let { v -> setLiveModeServer(v) } }
         asculta("app/notif_praf", Boolean::class.java) { (it as? Boolean)?.let { v -> setNotifPraf(v) } }
@@ -760,32 +700,37 @@ fun PurificatorAppMain() {
         containerColor = bgMain,
         bottomBar = {
             NavigationBar(containerColor = surfaceColor, modifier = Modifier.height(60.dp)) {
-                NavigationBarItem(icon = { Icon(Icons.Default.Home, null) }, selected = tabSelectat == 0, onClick = { setTabSelectat(0) }, colors = NavigationBarItemDefaults.colors(selectedIconColor = accentColor, unselectedIconColor = textSecondary, indicatorColor = if(isDarkMode) Color(0xFF2C2C2E) else Color(0xFFE5E5EA)))
-                NavigationBarItem(icon = { Icon(Icons.Default.DateRange, null) }, selected = tabSelectat == 1, onClick = { setTabSelectat(1) }, colors = NavigationBarItemDefaults.colors(selectedIconColor = accentColor, unselectedIconColor = textSecondary, indicatorColor = if(isDarkMode) Color(0xFF2C2C2E) else Color(0xFFE5E5EA)))
-                NavigationBarItem(icon = { Icon(Icons.Default.Settings, null) }, selected = tabSelectat == 2, onClick = { setTabSelectat(2) }, colors = NavigationBarItemDefaults.colors(selectedIconColor = accentColor, unselectedIconColor = textSecondary, indicatorColor = if(isDarkMode) Color(0xFF2C2C2E) else Color(0xFFE5E5EA)))
+                NavigationBarItem(icon = { Icon(Icons.Default.Home, null) }, selected = tabSelectat == 0, onClick = { setTabSelectat(0) }, colors = NavigationBarItemDefaults.colors(selectedIconColor = accentColor, unselectedIconColor = textSecondary, indicatorColor = if (isDarkMode) Color(0xFF2C2C2E) else Color(0xFFE5E5EA)))
+                NavigationBarItem(icon = { Icon(Icons.Default.DateRange, null) }, selected = tabSelectat == 1, onClick = { setTabSelectat(1) }, colors = NavigationBarItemDefaults.colors(selectedIconColor = accentColor, unselectedIconColor = textSecondary, indicatorColor = if (isDarkMode) Color(0xFF2C2C2E) else Color(0xFFE5E5EA)))
+                NavigationBarItem(icon = { Icon(Icons.Default.Settings, null) }, selected = tabSelectat == 2, onClick = { setTabSelectat(2) }, colors = NavigationBarItemDefaults.colors(selectedIconColor = accentColor, unselectedIconColor = textSecondary, indicatorColor = if (isDarkMode) Color(0xFF2C2C2E) else Color(0xFFE5E5EA)))
             }
         }
     ) { paddingValori ->
         Box(modifier = Modifier.padding(paddingValori).fillMaxSize()) {
             when (tabSelectat) {
                 0 -> EcranAcasa(
-                    prefs, categoryOrder, { newOrd -> onOrderChange(newOrd); prefs.edit(commit=true){putString("catOrder", newOrd.joinToString(","))} }, initLoadDone, ultimulUpdateServer, diferentaSecunde, lastHistoryTimeUnix,
+                    prefs, categoryOrder, { newOrd -> onOrderChange(newOrd); prefs.edit(commit = true) { putString("catOrder", newOrd.joinToString(",")) } },
+                    initLoadDone, ultimulUpdateServer, diferentaSecunde, lastHistoryTimeUnix,
                     speedControlServer, procentVentilatorServer, rpmServer, intervalSelectat,
                     pm1, pm25, pm4, pm10, co2, voc, nox, temp, umiditate,
                     istoricPM1, istoricPM25, istoricPM4, istoricPM10, istoricCO2, istoricVOC, istoricNOx, istoricTemp, istoricUmid,
                     accentColor, textPrimary, textSecondary, surfaceColor, tipGrafic,
-                    onIntervalChange = { setIntervalSelectat(it) }, onSpeedConfirmed = { database.child("setari/speed").setValue(it.toInt()) }
+                    onIntervalChange = { setIntervalSelectat(it) },
+                    onSpeedConfirmed = { database.child("setari/speed").setValue(it.toInt()) }
                 )
-                1 -> EcranArhiva(prefs, categoryOrder, { newOrd -> onOrderChange(newOrd); prefs.edit(commit=true){putString("catOrder", newOrd.joinToString(","))} }, database, accentColor, textPrimary, textSecondary, surfaceColor, dividerColor, tipGrafic)
+                1 -> EcranArhiva(prefs, categoryOrder, { newOrd -> onOrderChange(newOrd); prefs.edit(commit = true) { putString("catOrder", newOrd.joinToString(",")) } }, database, accentColor, textPrimary, textSecondary, surfaceColor, dividerColor, tipGrafic)
                 2 -> EcranSetari(
-                    context = context, prefs = prefs, nightModeActiv = nightModeApp, liveModeActiv = liveModeServer, notifPraf = notifPraf, notifGaze = notifGaze, notifOffline = notifOffline, errorLogString = errorLogServer, runInBackground = runInBackground,
-                    isDarkMode = isDarkMode, accentColor = accentColor, tipGrafic = tipGrafic, textPrimary = textPrimary, textSecondary = textSecondary, surfaceColor = surfaceColor,
+                    context = context, prefs = prefs, nightModeActiv = nightModeApp, liveModeActiv = liveModeServer,
+                    notifPraf = notifPraf, notifGaze = notifGaze, notifOffline = notifOffline, errorLogString = errorLogServer,
+                    runInBackground = runInBackground, isDarkMode = isDarkMode, accentColor = accentColor, tipGrafic = tipGrafic,
+                    textPrimary = textPrimary, textSecondary = textSecondary, surfaceColor = surfaceColor,
                     istoricExportPM = istoricPM25, istoricExportCO2 = istoricCO2, dividerColor = dividerColor,
-                    telemetrieRam = telemetrieRam, telemetrieTemp = telemetrieTemp, telemetrieRssi = telemetrieRssi, telemetrieUptime = telemetrieUptime, tempOffsetServer = tempOffsetServer,
-                    luminozitateServer = luminozitateServer, luminozitateLedServer = luminozitateLedServer, // NEW: pass LED variable
+                    telemetrieRam = telemetrieRam, telemetrieTemp = telemetrieTemp, telemetrieRssi = telemetrieRssi,
+                    telemetrieUptime = telemetrieUptime, tempOffsetServer = tempOffsetServer,
+                    luminozitateServer = luminozitateServer, luminozitateLedServer = luminozitateLedServer,
                     onNightModeChange = { database.child("setari/night_mode").setValue(it) },
                     onLuminozitateChange = { database.child("setari/luminozitate").setValue(it) },
-                    onLuminozitateLedChange = { database.child("setari/luminozitate_led").setValue(it) }, // NEW: handle LED changes
+                    onLuminozitateLedChange = { database.child("setari/luminozitate_led").setValue(it) },
                     onLiveModeChange = { database.child("setari/live_mode").setValue(it) },
                     onNotifPrafChange = { database.child("app/notif_praf").setValue(it) },
                     onNotifGazeChange = { database.child("app/notif_gaze").setValue(it) },
@@ -793,16 +738,14 @@ fun PurificatorAppMain() {
                     onRunInBackgroundChange = {
                         setRunInBackground(it); prefs.edit(commit = true) { putBoolean("runInBackground", it) }
                         val i = Intent(context, SmartPurifierService::class.java)
-                        if(it) { context.startForegroundService(i) } else { context.stopService(i) }
+                        if (it) context.startForegroundService(i) else context.stopService(i)
                     },
-                    onThemeChange = { valMode -> setIsDarkMode(valMode); prefs.edit(commit = true) { putBoolean("isDarkMode", valMode) } },
-                    onColorChange = { valColorInt -> setAccentColor(Color(valColorInt)); prefs.edit(commit = true) { putInt("themeColor", valColorInt) } },
-                    onTipGraficChange = { valTip -> setTipGrafic(valTip); prefs.edit(commit = true) { putInt("tipGrafic", valTip) } },
+                    onThemeChange = { v -> setIsDarkMode(v); prefs.edit(commit = true) { putBoolean("isDarkMode", v) } },
+                    onColorChange = { v -> setAccentColor(Color(v)); prefs.edit(commit = true) { putInt("themeColor", v) } },
+                    onTipGraficChange = { v -> setTipGrafic(v); prefs.edit(commit = true) { putInt("tipGrafic", v) } },
                     onCleanSensor = { database.child("setari/curatare").setValue(true) },
                     onRestartBoard = { database.child("setari/restart").setValue(true) },
-                    onTempOffsetChange = { valoareSlider ->
-                        val offsetExactDouble = (valoareSlider * 10f).roundToInt() / 10.0
-                        database.child("setari/temp_offset").setValue(offsetExactDouble) },
+                    onTempOffsetChange = { v -> database.child("setari/temp_offset").setValue((v * 10f).roundToInt() / 10.0) },
                     onResetCalibrari = { database.child("setari/reset_calibrare").setValue(true) }
                 )
             }
@@ -810,39 +753,44 @@ fun PurificatorAppMain() {
     }
 }
 
-// ================= ECRAN SCOR ZILNIC (DOAR PE HOME) =================
+// ================= ECRAN SCOR ZILNIC =================
 @Composable
 fun CardScorZilnic(istoricPM25: List<Float>, istoricCO2: List<Float>, istoricVOC: List<Float>, istoricNOx: List<Float>, surfaceColor: Color, textPrimary: Color, textSecondary: Color) {
-    val pmValid = istoricPM25.filter { it != -999f }; val co2Valid = istoricCO2.filter { it != -999f }
-    val vocValid = istoricVOC.filter { it != -999f }; val noxValid = istoricNOx.filter { it != -999f }
-
-    val avgPm = if (pmValid.isNotEmpty()) pmValid.average().toFloat() else 0f
-    val avgCo2 = if (co2Valid.isNotEmpty()) co2Valid.average().toFloat() else 400f
-    val avgVoc = if (vocValid.isNotEmpty()) vocValid.average().toFloat() else 0f
-    val avgNox = if (noxValid.isNotEmpty()) noxValid.average().toFloat() else 0f
-
-    val sPm = (100f - (avgPm / 55f * 100f)).coerceIn(0f, 100f)
-    val sCo2 = (100f - ((avgCo2 - 400f).coerceAtLeast(0f) / 1100f * 100f)).coerceIn(0f, 100f)
-    val sVoc = (100f - (avgVoc / 400f * 100f)).coerceIn(0f, 100f)
-    val sNox = (100f - (avgNox / 200f * 100f)).coerceIn(0f, 100f)
-
-    var scorFinal = ((sPm * 0.40f) + (sCo2 * 0.30f) + (sVoc * 0.20f) + (sNox * 0.10f)).roundToInt()
-    if (pmValid.isEmpty()) scorFinal = 100
-
+    // FIX #11: Calcule grele memoizate cu cheile corecte — nu se recalculează la fiecare recompoziție
+    val scorFinal = remember(istoricPM25, istoricCO2, istoricVOC, istoricNOx) {
+        val pmValid = istoricPM25.filter { it != -999f }; val co2Valid = istoricCO2.filter { it != -999f }
+        val vocValid = istoricVOC.filter { it != -999f }; val noxValid = istoricNOx.filter { it != -999f }
+        val avgPm = if (pmValid.isNotEmpty()) pmValid.average().toFloat() else 0f
+        val avgCo2 = if (co2Valid.isNotEmpty()) co2Valid.average().toFloat() else 400f
+        val avgVoc = if (vocValid.isNotEmpty()) vocValid.average().toFloat() else 0f
+        val avgNox = if (noxValid.isNotEmpty()) noxValid.average().toFloat() else 0f
+        val sPm = (100f - (avgPm / 55f * 100f)).coerceIn(0f, 100f)
+        val sCo2 = (100f - ((avgCo2 - 400f).coerceAtLeast(0f) / 1100f * 100f)).coerceIn(0f, 100f)
+        val sVoc = (100f - (avgVoc / 400f * 100f)).coerceIn(0f, 100f)
+        val sNox = (100f - (avgNox / 200f * 100f)).coerceIn(0f, 100f)
+        val scor = ((sPm * 0.40f) + (sCo2 * 0.30f) + (sVoc * 0.20f) + (sNox * 0.10f)).roundToInt()
+        if (pmValid.isEmpty()) 100 else scor
+    }
     val colorScor = when { scorFinal >= 90 -> Color.Green; scorFinal >= 70 -> Color(0xFFFFC107); scorFinal >= 50 -> Color(0xFFFF9800); else -> Color.Red }
     val mesaj = when { scorFinal >= 90 -> "Aer Excelent azi"; scorFinal >= 70 -> "Aer Bun, mai aerisește"; scorFinal >= 50 -> "Calitate Medie"; else -> "Poluare Ridicată!" }
 
     Row(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(surfaceColor).padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
         Box(contentAlignment = Alignment.Center, modifier = Modifier.size(60.dp)) {
-            Canvas(modifier = Modifier.fillMaxSize()) { drawArc(color = colorScor.copy(alpha = 0.2f), startAngle = 0f, sweepAngle = 360f, useCenter = false, style = Stroke(8.dp.toPx(), cap = StrokeCap.Round)); drawArc(color = colorScor, startAngle = -90f, sweepAngle = (scorFinal / 100f) * 360f, useCenter = false, style = Stroke(8.dp.toPx(), cap = StrokeCap.Round)) }
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                drawArc(color = colorScor.copy(alpha = 0.2f), startAngle = 0f, sweepAngle = 360f, useCenter = false, style = Stroke(8.dp.toPx(), cap = StrokeCap.Round))
+                drawArc(color = colorScor, startAngle = -90f, sweepAngle = (scorFinal / 100f) * 360f, useCenter = false, style = Stroke(8.dp.toPx(), cap = StrokeCap.Round))
+            }
             Text("$scorFinal", color = textPrimary, fontWeight = FontWeight.Bold, fontSize = 20.sp)
         }
         Spacer(Modifier.width(16.dp))
-        Column { Text("Calitate Aer (Ultimele 24h)", color = textSecondary, fontSize = 12.sp, fontWeight = FontWeight.Bold); Text(mesaj, color = textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium) }
+        Column {
+            Text("Calitate Aer (Ultimele 24h)", color = textSecondary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+            Text(mesaj, color = textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium)
+        }
     }
 }
 
-// ================= DRAG & DROP & GLOBAL STATE =================
+// ================= DRAG & DROP =================
 @Composable
 fun DraggableCategoryGroup(
     prefs: SharedPreferences, surfaceColor: Color, textSecondary: Color, categoryOrder: List<Int>, onOrderChange: (List<Int>) -> Unit,
@@ -859,28 +807,53 @@ fun DraggableCategoryGroup(
         categoryOrder.forEach { catId ->
             key(catId) {
                 val isDragged = draggedCatId == catId
-                val zIndex = if (isDragged) 1f else 0f
                 val offsetY = if (isDragged) dragOffsetY else 0f
                 val titlu = when(catId) { 0 -> "PARTICULE (µg/m³)"; 1 -> "GAZE ȘI CHIMICALE"; else -> "CLIMĂ" }
                 val isExp = when(catId) { 0 -> expPraf; 1 -> expGaze; else -> expClima }
-                val toggleExpand = { when(catId) { 0 -> { setExpPraf(!expPraf); prefs.edit(commit = true) { putBoolean("expPraf", !expPraf) } }; 1 -> { setExpGaze(!expGaze); prefs.edit(commit = true) { putBoolean("expGaze", !expGaze) } }; 2 -> { setExpClima(!expClima); prefs.edit(commit = true) { putBoolean("expClima", !expClima) } } } }
-
-                Box(modifier = Modifier.zIndex(zIndex).offset { IntOffset(0, offsetY.roundToInt()) }) {
+                val toggleExpand: () -> Unit = {
+                    when(catId) {
+                        0 -> { setExpPraf(!expPraf); prefs.edit(commit = true) { putBoolean("expPraf", !expPraf) } }
+                        1 -> { setExpGaze(!expGaze); prefs.edit(commit = true) { putBoolean("expGaze", !expGaze) } }
+                        2 -> { setExpClima(!expClima); prefs.edit(commit = true) { putBoolean("expClima", !expClima) } }
+                    }
+                }
+                Box(modifier = Modifier.zIndex(if (isDragged) 1f else 0f).offset { IntOffset(0, offsetY.roundToInt()) }) {
                     Column {
                         Row(
-                            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).background(surfaceColor).pointerInput(catId) {
-                                detectDragGesturesAfterLongPress(
-                                    onDragStart = { setDraggedCatId(catId); setDragOffsetY(0f) }, onDragEnd = { setDraggedCatId(null); setDragOffsetY(0f) }, onDragCancel = { setDraggedCatId(null); setDragOffsetY(0f) },
-                                    onDrag = { change, dragAmount ->
-                                        change.consume(); setDragOffsetY(dragOffsetY + dragAmount.y); val currentPos = categoryOrder.indexOf(catId)
-                                        if (dragOffsetY > swapThreshold && currentPos < categoryOrder.size - 1) { val mutList = categoryOrder.toMutableList(); val temp = mutList[currentPos]; mutList[currentPos] = mutList[currentPos + 1]; mutList[currentPos + 1] = temp; onOrderChange(mutList); setDragOffsetY(dragOffsetY - swapThreshold) }
-                                        else if (dragOffsetY < -swapThreshold && currentPos > 0) { val mutList = categoryOrder.toMutableList(); val temp = mutList[currentPos]; mutList[currentPos] = mutList[currentPos - 1]; mutList[currentPos - 1] = temp; onOrderChange(mutList); setDragOffsetY(dragOffsetY + swapThreshold) }
-                                    }
-                                )
-                            }.clickable { toggleExpand() }.padding(horizontal = 16.dp, vertical = 12.dp),
+                            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).background(surfaceColor)
+                                .pointerInput(catId) {
+                                    detectDragGesturesAfterLongPress(
+                                        onDragStart = { setDraggedCatId(catId); setDragOffsetY(0f) },
+                                        onDragEnd = { setDraggedCatId(null); setDragOffsetY(0f) },
+                                        onDragCancel = { setDraggedCatId(null); setDragOffsetY(0f) },
+                                        onDrag = { change, dragAmount ->
+                                            change.consume()
+                                            setDragOffsetY(dragOffsetY + dragAmount.y)
+                                            val currentPos = categoryOrder.indexOf(catId)
+                                            if (dragOffsetY > swapThreshold && currentPos < categoryOrder.size - 1) {
+                                                val mutList = categoryOrder.toMutableList()
+                                                mutList[currentPos] = mutList[currentPos + 1].also { mutList[currentPos + 1] = mutList[currentPos] }
+                                                onOrderChange(mutList); setDragOffsetY(dragOffsetY - swapThreshold)
+                                            } else if (dragOffsetY < -swapThreshold && currentPos > 0) {
+                                                val mutList = categoryOrder.toMutableList()
+                                                mutList[currentPos] = mutList[currentPos - 1].also { mutList[currentPos - 1] = mutList[currentPos] }
+                                                onOrderChange(mutList); setDragOffsetY(dragOffsetY + swapThreshold)
+                                            }
+                                        }
+                                    )
+                                }
+                                .clickable { toggleExpand() }.padding(horizontal = 16.dp, vertical = 12.dp),
                             verticalAlignment = Alignment.CenterVertically
-                        ) { Text(titlu, color = textSecondary, fontSize = 12.sp, fontWeight = FontWeight.Bold); Spacer(Modifier.weight(1f)); Icon(imageVector = if (isExp) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown, contentDescription = "Expand", tint = textSecondary) }
-                        AnimatedVisibility(visible = isExp) { Column(modifier = Modifier.padding(top = 8.dp)) { when(catId) { 0 -> contentPraf(); 1 -> contentGaze(); 2 -> contentClima() } } }
+                        ) {
+                            Text(titlu, color = textSecondary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                            Spacer(Modifier.weight(1f))
+                            Icon(imageVector = if (isExp) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown, contentDescription = "Expand", tint = textSecondary)
+                        }
+                        AnimatedVisibility(visible = isExp) {
+                            Column(modifier = Modifier.padding(top = 8.dp)) {
+                                when(catId) { 0 -> contentPraf(); 1 -> contentGaze(); 2 -> contentClima() }
+                            }
+                        }
                     }
                 }
             }
@@ -889,7 +862,6 @@ fun DraggableCategoryGroup(
 }
 
 // ================= TAB 1: DASHBOARD =================
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun EcranAcasa(
     prefs: SharedPreferences, categoryOrder: List<Int>, onOrderChange: (List<Int>) -> Unit,
@@ -918,26 +890,21 @@ fun EcranAcasa(
     val (activeChartId, setActiveChartId) = remember { mutableStateOf<String?>(null) }
     val onGlobalTouch: (Int?, String?) -> Unit = { idx, id -> setGlobalTouchIndex(idx); setActiveChartId(id) }
 
-    LaunchedEffect(speedControlServer) {
-        if (!isDragging) {
-            setLocalSliderValue(speedControlServer.coerceAtLeast(1f))
-        }
-    }
+    LaunchedEffect(speedControlServer) { if (!isDragging) setLocalSliderValue(speedControlServer.coerceAtLeast(1f)) }
 
-    val animPm1 by animateFloatAsState(pm1, tween(1000, easing = FastOutSlowInEasing))
-    val animPm25 by animateFloatAsState(pm25, tween(1000, easing = FastOutSlowInEasing))
-    val animPm4 by animateFloatAsState(pm4, tween(1000, easing = FastOutSlowInEasing))
-    val animPm10 by animateFloatAsState(pm10, tween(1000, easing = FastOutSlowInEasing))
-    val animCo2 by animateFloatAsState(co2.toFloat(), tween(1000, easing = FastOutSlowInEasing))
-    val animVoc by animateFloatAsState(voc, tween(1000, easing = FastOutSlowInEasing))
-    val animNox by animateFloatAsState(nox, tween(1000, easing = FastOutSlowInEasing))
-    val animTemp by animateFloatAsState(temp, tween(1000, easing = FastOutSlowInEasing))
-    val animUmid by animateFloatAsState(umiditate, tween(1000, easing = FastOutSlowInEasing))
+    val animPm1 by animateFloatAsState(pm1, tween(1000, easing = FastOutSlowInEasing), label = "pm1")
+    val animPm25 by animateFloatAsState(pm25, tween(1000, easing = FastOutSlowInEasing), label = "pm25")
+    val animPm4 by animateFloatAsState(pm4, tween(1000, easing = FastOutSlowInEasing), label = "pm4")
+    val animPm10 by animateFloatAsState(pm10, tween(1000, easing = FastOutSlowInEasing), label = "pm10")
+    val animCo2 by animateFloatAsState(co2.toFloat(), tween(1000, easing = FastOutSlowInEasing), label = "co2")
+    val animVoc by animateFloatAsState(voc, tween(1000, easing = FastOutSlowInEasing), label = "voc")
+    val animNox by animateFloatAsState(nox, tween(1000, easing = FastOutSlowInEasing), label = "nox")
+    val animTemp by animateFloatAsState(temp, tween(1000, easing = FastOutSlowInEasing), label = "temp")
+    val animUmid by animateFloatAsState(umiditate, tween(1000, easing = FastOutSlowInEasing), label = "umid")
 
     Column(modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp, vertical = 8.dp).verticalScroll(rememberScrollState())) {
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
             Text("SISTEM CONTROL", color = textSecondary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-
             val statusText = when {
                 !initLoadDone -> "Conectare..."
                 diferentaSecunde < 10 -> "Conectat: Acum"
@@ -946,14 +913,10 @@ fun EcranAcasa(
                 diferentaSecunde < 3600 -> "Deconectat: ${diferentaSecunde / 60}m"
                 else -> "Deconectat: ${diferentaSecunde / 3600}h"
             }
-
             val statusColor = when {
-                !initLoadDone -> textSecondary
-                diferentaSecunde < 30 -> textSecondary
-                diferentaSecunde < 60 -> Color(0xFFFF9800)
-                else -> Color.Red
+                !initLoadDone -> textSecondary; diferentaSecunde < 30 -> textSecondary
+                diferentaSecunde < 60 -> Color(0xFFFF9800); else -> Color.Red
             }
-
             Text(statusText, color = statusColor, fontSize = 12.sp)
         }
         Spacer(modifier = Modifier.height(12.dp))
@@ -961,36 +924,31 @@ fun EcranAcasa(
         val isAuto = speedControlServer == 0f
         val isOprit = localSliderValue < 5f && !isAuto
         val displaySliderValue = if (isAuto) procentVentilatorServer.toFloat().coerceIn(1f, 100f) else localSliderValue.coerceIn(1f, 100f)
-        val statusBtnText = if (isOprit) "OPRIT" else "${displaySliderValue.roundToInt()}%"
 
         Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-            Text(text = "Putere: $statusBtnText", color = if (isOprit) Color.Red.copy(alpha = 0.8f) else textPrimary, fontSize = 16.sp, modifier = Modifier.weight(1f), textAlign = TextAlign.Start)
-            Button(onClick = { setLocalSliderValue(1f); onSpeedConfirmed(0f) }, colors = ButtonDefaults.buttonColors(containerColor = if (isAuto) accentColor else surfaceColor), shape = RoundedCornerShape(8.dp), border = if (!isAuto) BorderStroke(1.dp, textSecondary.copy(alpha = 0.5f)) else null, contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp), modifier = Modifier.height(32.dp)) { Text("AUTO", color = if (isAuto) Color.White else textPrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold) }
+            Text(text = "Putere: ${if (isOprit) "OPRIT" else "${displaySliderValue.roundToInt()}%"}", color = if (isOprit) Color.Red.copy(alpha = 0.8f) else textPrimary, fontSize = 16.sp, modifier = Modifier.weight(1f), textAlign = TextAlign.Start)
+            Button(onClick = { setLocalSliderValue(1f); onSpeedConfirmed(0f) }, colors = ButtonDefaults.buttonColors(containerColor = if (isAuto) accentColor else surfaceColor), shape = RoundedCornerShape(8.dp), border = if (!isAuto) BorderStroke(1.dp, textSecondary.copy(alpha = 0.5f)) else null, contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp), modifier = Modifier.height(32.dp)) {
+                Text("AUTO", color = if (isAuto) Color.White else textPrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+            }
             Text(text = "$rpmServer RPM", color = textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f), textAlign = TextAlign.End)
         }
 
         SliderInteligentCustom(
-            value = displaySliderValue,
-            valueRange = 1f..100f,
-            stepSize = 1f,
+            value = displaySliderValue, valueRange = 1f..100f, stepSize = 1f,
             onValueChange = { isDragging = true; setLocalSliderValue(it) },
-            onValueChangeFinished = { finalValue ->
-                isDragging = false
-                onSpeedConfirmed(finalValue)
-            },
+            onValueChangeFinished = { finalValue -> isDragging = false; onSpeedConfirmed(finalValue) },
             onDragStateChange = { isDragging = it },
-            accentColor = accentColor,
-            textSecondary = textSecondary,
-            hasHoverStopZone = true,
-            stopZoneRange = 1f..4f,
-            isAuto = isAuto
+            accentColor = accentColor, textSecondary = textSecondary,
+            hasHoverStopZone = true, stopZoneRange = 1f..4f, isAuto = isAuto
         )
 
         Spacer(modifier = Modifier.height(16.dp))
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
             IntervalTimp.entries.forEach { interval ->
                 val isSelected = intervalSelectat == interval
-                Box(modifier = Modifier.clip(RoundedCornerShape(8.dp)).background(if (isSelected) accentColor else surfaceColor).clickable { onIntervalChange(interval) }.padding(horizontal = 24.dp, vertical = 8.dp)) { Text("${interval.ore}h", color = if (isSelected) Color.White else textPrimary, fontWeight = FontWeight.Bold) }
+                Box(modifier = Modifier.clip(RoundedCornerShape(8.dp)).background(if (isSelected) accentColor else surfaceColor).clickable { onIntervalChange(interval) }.padding(horizontal = 24.dp, vertical = 8.dp)) {
+                    Text("${interval.ore}h", color = if (isSelected) Color.White else textPrimary, fontWeight = FontWeight.Bold)
+                }
             }
         }
         Spacer(modifier = Modifier.height(24.dp))
@@ -1008,7 +966,6 @@ fun EcranAcasa(
                 SenzorCard("NOx (Index)", animNox, nox > 1000f, istoricNOx, intervalSelectat, false, null, true, textPrimary, textSecondary, tipGrafic, "NOx", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, trendNox, lastHistoryTimeUnix) { v -> if (v == -999f) Color.Transparent else if (v < 20) Color.Green else if (v < 150) Color(0xFFFFC107) else if (v < 300) Color(0xFFFF9800) else Color.Red }
             },
             contentClima = {
-                // MODIFICAT AICI: Transmitem parametrul `douaZecimaleLive = true` pentru ambele carduri de climă
                 SenzorCard("Temperatură (°C)", animTemp, false, istoricTemp, intervalSelectat, false, null, false, textPrimary, textSecondary, tipGrafic, "Temp", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.TEMPERATURE, trendTemp, lastHistoryTimeUnix, douaZecimaleLive = true, colorLogic = ::getTempColor)
                 SenzorCard("Umiditate (%)", animUmid, false, istoricUmid, intervalSelectat, false, 100f, false, textPrimary, textSecondary, tipGrafic, "Umid", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.HUMIDITY, trendUmid, lastHistoryTimeUnix, douaZecimaleLive = true, colorLogic = ::getHumidColor)
             }
@@ -1019,15 +976,13 @@ fun EcranAcasa(
     }
 }
 
-// ================= TAB 2: ARHIVĂ (Format Nou: yyyy_MM_dd) =================
+// ================= TAB 2: ARHIVĂ =================
 @Composable
 fun EcranArhiva(prefs: SharedPreferences, categoryOrder: List<Int>, onOrderChange: (List<Int>) -> Unit, database: DatabaseReference, accentColor: Color, textPrimary: Color, textSecondary: Color, surfaceColor: Color, dividerColor: Color, tipGrafic: Int) {
     val (arhivaData, setArhivaData) = remember { mutableStateOf<Map<String, Map<String, List<Float>>>>(emptyMap()) }
     val (listaZileReale, setListaZileReale) = remember { mutableStateOf<List<Pair<String, LocalDate>>>(emptyList()) }
     val (saptamanaSelectata, setSaptamanaSelectata) = remember { mutableStateOf<LocalDate?>(null) }
     val (ziSelectata, setZiSelectata) = remember { mutableStateOf<String?>(null) }
-
-    // MODIFICAT: Formatul nou pentru parsare
     val formatter = DateTimeFormatter.ofPattern("yyyy_MM_dd")
 
     val (globalTouchIndex, setGlobalTouchIndex) = remember { mutableStateOf<Int?>(null) }
@@ -1046,36 +1001,37 @@ fun EcranArhiva(prefs: SharedPreferences, categoryOrder: List<Int>, onOrderChang
                         zileParsate.add(key to dateObj)
                         mapNou[key] = mapOf(
                             "PM25" to parseIstoric(ziSnap.child("PM25").getValue(String::class.java)),
-                            "CO2" to parseIstoric(ziSnap.child("CO2").getValue(String::class.java)),
-                            "VOC" to parseIstoric(ziSnap.child("VOC").getValue(String::class.java), true),
-                            "NOx" to parseIstoric(ziSnap.child("NOx").getValue(String::class.java), true),
+                            "CO2"  to parseIstoric(ziSnap.child("CO2").getValue(String::class.java)),
+                            "VOC"  to parseIstoric(ziSnap.child("VOC").getValue(String::class.java), true),
+                            "NOx"  to parseIstoric(ziSnap.child("NOx").getValue(String::class.java), true),
                             "Temp" to parseIstoric(ziSnap.child("Temp").getValue(String::class.java)),
-                            "RH" to parseIstoric(ziSnap.child("Umid").getValue(String::class.java))
+                            "RH"   to parseIstoric(ziSnap.child("Umid").getValue(String::class.java))
                         )
                     } catch (_: Exception) { continue }
                 }
-
                 setArhivaData(mapNou)
-                // Acum zilele vin deja sortate de la Firebase, doar le salvăm
                 setListaZileReale(zileParsate)
-
-                if (zileParsate.isNotEmpty() && saptamanaSelectata == null) {
-                    val latestDay = zileParsate.last().second
-                    setSaptamanaSelectata(latestDay.with(DayOfWeek.MONDAY))
-                    setZiSelectata(zileParsate.last().first)
+                // FIX #6: Resetare selecție la ultima zi disponibilă la date noi
+                // (protejează împotriva selecției unei zile care nu mai există)
+                if (zileParsate.isNotEmpty()) {
+                    val ultimaZi = zileParsate.last()
+                    val saptamanaUltimeiZile = ultimaZi.second.with(DayOfWeek.MONDAY)
+                    if (saptamanaSelectata == null || zileParsate.none { it.first == ziSelectata }) {
+                        setSaptamanaSelectata(saptamanaUltimeiZile)
+                        setZiSelectata(ultimaZi.first)
+                    }
                 }
             }
             override fun onCancelled(error: DatabaseError) {}
         }
-
-        // MODIFICAT: Revenir la limitToLast(28) pentru viteză, deoarece sortarea yyyy_MM_dd este nativă
         val query = database.child("Arhiva_Zilnica").orderByKey().limitToLast(28)
         query.addValueEventListener(listener)
         onDispose { query.removeEventListener(listener) }
     }
 
+    // FIX #8: remember cu cheie pentru a evita recalculările inutile
     val saptamaniMap = remember(listaZileReale) { listaZileReale.groupBy { it.second.with(DayOfWeek.MONDAY) } }
-    val saptamaniValide = saptamaniMap.keys.sorted().takeLast(4)
+    val saptamaniValide = remember(saptamaniMap) { saptamaniMap.keys.sorted().takeLast(4) }
 
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
         Text("ARHIVĂ CALITATE AER", color = textSecondary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
@@ -1086,10 +1042,8 @@ fun EcranArhiva(prefs: SharedPreferences, categoryOrder: List<Int>, onOrderChang
             saptamaniValide.forEach { luneaSaptamanii ->
                 val isSelected = saptamanaSelectata == luneaSaptamanii
                 val duminica = luneaSaptamanii.plusDays(6)
-                val m1 = getMonthRoShort(luneaSaptamanii.monthValue)
-                val m2 = getMonthRoShort(duminica.monthValue)
+                val m1 = getMonthRoShort(luneaSaptamanii.monthValue); val m2 = getMonthRoShort(duminica.monthValue)
                 val titlu = if (m1 == m2) "${luneaSaptamanii.dayOfMonth}-${duminica.dayOfMonth}\n$m1" else "${luneaSaptamanii.dayOfMonth} $m1\n${duminica.dayOfMonth} $m2"
-
                 Box(modifier = Modifier.weight(1f).clip(RoundedCornerShape(8.dp)).background(if (isSelected) accentColor else surfaceColor).clickable { setSaptamanaSelectata(luneaSaptamanii); setZiSelectata(saptamaniMap[luneaSaptamanii]?.last()?.first) }.padding(vertical = 8.dp, horizontal = 2.dp), contentAlignment = Alignment.Center) {
                     Text(titlu, color = if (isSelected) Color.White else textPrimary, fontWeight = FontWeight.Bold, fontSize = 12.sp, textAlign = TextAlign.Center, lineHeight = 14.sp)
                 }
@@ -1119,10 +1073,8 @@ fun EcranArhiva(prefs: SharedPreferences, categoryOrder: List<Int>, onOrderChang
         Spacer(modifier = Modifier.height(16.dp))
 
         val dateZi = arhivaData[ziSelectata] ?: emptyMap()
-
         Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
-            DraggableCategoryGroup(
-                prefs = prefs, surfaceColor = surfaceColor, textSecondary = textSecondary, categoryOrder = categoryOrder, onOrderChange = onOrderChange,
+            DraggableCategoryGroup(prefs = prefs, surfaceColor = surfaceColor, textSecondary = textSecondary, categoryOrder = categoryOrder, onOrderChange = onOrderChange,
                 contentPraf = { SenzorCard("PM 2.5 (Praf)", 0f, true, dateZi["PM25"] ?: emptyList(), IntervalTimp.ORE_24, true, null, false, textPrimary, textSecondary, tipGrafic, "AR_PM25", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, 0, 0L) { v -> if (v == -999f) Color.Transparent else if (v < 12) Color.Green else if (v < 35) Color(0xFFFFC107) else if (v < 55) Color(0xFFFF9800) else Color.Red } },
                 contentGaze = {
                     SenzorCard("CO2 (Dioxid de Carbon)", 0f, true, dateZi["CO2"] ?: emptyList(), IntervalTimp.ORE_24, true, null, true, textPrimary, textSecondary, tipGrafic, "AR_CO2", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, 0, 0L) { v -> if (v == -999f) Color.Transparent else if (v < 800) Color.Green else if (v < 1000) Color(0xFFFFC107) else if (v < 1500) Color(0xFFFF9800) else Color.Red }
@@ -1142,41 +1094,40 @@ fun EcranArhiva(prefs: SharedPreferences, categoryOrder: List<Int>, onOrderChang
 // ================= TAB 3: SETĂRI =================
 @Composable
 fun EcranSetari(
-    context: Context, prefs: SharedPreferences, nightModeActiv: Boolean, liveModeActiv: Boolean, notifPraf: Boolean, notifGaze: Boolean, notifOffline: Boolean, errorLogString: String, runInBackground: Boolean,
+    context: Context, prefs: SharedPreferences, nightModeActiv: Boolean, liveModeActiv: Boolean,
+    notifPraf: Boolean, notifGaze: Boolean, notifOffline: Boolean, errorLogString: String, runInBackground: Boolean,
     isDarkMode: Boolean, accentColor: Color, tipGrafic: Int, textPrimary: Color, textSecondary: Color, surfaceColor: Color,
     istoricExportPM: List<Float>, istoricExportCO2: List<Float>, dividerColor: Color,
     telemetrieRam: Int, telemetrieTemp: Float, telemetrieRssi: Int, telemetrieUptime: Long, tempOffsetServer: Float,
-    luminozitateServer: Int, luminozitateLedServer: Int, // NEW: added LED variable
-    onNightModeChange: (Boolean) -> Unit, onLuminozitateChange: (Int) -> Unit, onLuminozitateLedChange: (Int) -> Unit, // NEW: added LED handler
+    luminozitateServer: Int, luminozitateLedServer: Int,
+    onNightModeChange: (Boolean) -> Unit, onLuminozitateChange: (Int) -> Unit, onLuminozitateLedChange: (Int) -> Unit,
     onLiveModeChange: (Boolean) -> Unit, onNotifPrafChange: (Boolean) -> Unit,
     onNotifGazeChange: (Boolean) -> Unit, onNotifOfflineChange: (Boolean) -> Unit, onRunInBackgroundChange: (Boolean) -> Unit,
     onThemeChange: (Boolean) -> Unit, onColorChange: (Int) -> Unit, onTipGraficChange: (Int) -> Unit,
     onCleanSensor: () -> Unit, onRestartBoard: () -> Unit,
     onTempOffsetChange: (Float) -> Unit, onResetCalibrari: () -> Unit
 ) {
-    val (showCleanDialog, setShowCleanDialog) = remember { mutableStateOf(false) }
-    val (showRestartDialog, setShowRestartDialog) = remember { mutableStateOf(false) }
-    val (showErrorDialog, setShowErrorDialog) = remember { mutableStateOf(false) }
-    val (showResetCalibDialog, setShowResetCalibDialog) = remember { mutableStateOf(false) }
-    val (showExportDialog, setShowExportDialog) = remember { mutableStateOf(false) }
-    val (isExporting, setIsExporting) = remember { mutableStateOf(false) }
-    val (csvContentToSave, setCsvContentToSave) = remember { mutableStateOf("") }
+    var showCleanDialog by remember { mutableStateOf(false) }
+    var showRestartDialog by remember { mutableStateOf(false) }
+    var showErrorDialog by remember { mutableStateOf(false) }
+    var showResetCalibDialog by remember { mutableStateOf(false) }
+    var showExportDialog by remember { mutableStateOf(false) }
+    var isExporting by remember { mutableStateOf(false) }
+    var csvContentToSave by remember { mutableStateOf("") }
 
     val exportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/csv")) { uri ->
-        setIsExporting(false)
-        if (uri != null) { context.contentResolver.openOutputStream(uri)?.use { out -> out.write(csvContentToSave.toByteArray()) } }
+        isExporting = false
+        if (uri != null) { context.contentResolver.openOutputStream(uri)?.use { it.write(csvContentToSave.toByteArray()) } }
     }
 
     if (showCleanDialog) {
-        AlertDialog(onDismissRequest = { setShowCleanDialog(false) }, title = { Text("Curățare Senzor SEN66", fontWeight = FontWeight.Bold) }, text = { Text("Această comandă va porni ventilatorul intern al senzorului la turație maximă pentru a elimina depunerile de praf. Ești sigur?") }, confirmButton = { TextButton(onClick = { setShowCleanDialog(false); onCleanSensor() }) { Text("Curăță", color = accentColor) } }, dismissButton = { TextButton(onClick = { setShowCleanDialog(false) }) { Text("Anulează", color = textSecondary) } }, containerColor = surfaceColor, titleContentColor = textPrimary, textContentColor = textPrimary)
+        AlertDialog(onDismissRequest = { showCleanDialog = false }, title = { Text("Curățare Senzor SEN66", fontWeight = FontWeight.Bold) }, text = { Text("Această comandă va porni ventilatorul intern al senzorului la turație maximă pentru a elimina depunerile de praf. Ești sigur?") }, confirmButton = { TextButton(onClick = { showCleanDialog = false; onCleanSensor() }) { Text("Curăță", color = accentColor) } }, dismissButton = { TextButton(onClick = { showCleanDialog = false }) { Text("Anulează", color = textSecondary) } }, containerColor = surfaceColor, titleContentColor = textPrimary, textContentColor = textPrimary)
     }
-
     if (showRestartDialog) {
-        AlertDialog(onDismissRequest = { setShowRestartDialog(false) }, title = { Text("Restartare Sistem", fontWeight = FontWeight.Bold, color = Color.Red) }, text = { Text("Plăcuța ESP32 va fi oprită și repornită forțat. Conexiunea WiFi se va întrerupe pentru câteva secunde. Continuăm?") }, confirmButton = { TextButton(onClick = { setShowRestartDialog(false); onRestartBoard() }) { Text("Restart", color = Color.Red) } }, dismissButton = { TextButton(onClick = { setShowRestartDialog(false) }) { Text("Anulează", color = textSecondary) } }, containerColor = surfaceColor, titleContentColor = textPrimary, textContentColor = textPrimary)
+        AlertDialog(onDismissRequest = { showRestartDialog = false }, title = { Text("Restartare Sistem", fontWeight = FontWeight.Bold, color = Color.Red) }, text = { Text("Plăcuța ESP32 va fi oprită și repornită forțat. Conexiunea WiFi se va întrerupe pentru câteva secunde. Continuăm?") }, confirmButton = { TextButton(onClick = { showRestartDialog = false; onRestartBoard() }) { Text("Restart", color = Color.Red) } }, dismissButton = { TextButton(onClick = { showRestartDialog = false }) { Text("Anulează", color = textSecondary) } }, containerColor = surfaceColor, titleContentColor = textPrimary, textContentColor = textPrimary)
     }
-
     if (showResetCalibDialog) {
-        AlertDialog(onDismissRequest = { setShowResetCalibDialog(false) }, title = { Text("Resetare Calibrări", fontWeight = FontWeight.Bold, color = Color.Red) }, text = { Text("Atenție! Această acțiune va șterge permanent memoria internă a algrogramului VOC. Senzorul va avea nevoie de 12-24 de ore să se re-calibreze la aerul din cameră. Aparatul se va restarta automat. Ești sigur?") }, confirmButton = { TextButton(onClick = { setShowResetCalibDialog(false); onResetCalibrari() }) { Text("Resetare", color = Color.Red) } }, dismissButton = { TextButton(onClick = { setShowResetCalibDialog(false) }) { Text("Anulează", color = textSecondary) } }, containerColor = surfaceColor, titleContentColor = textPrimary, textContentColor = textPrimary)
+        AlertDialog(onDismissRequest = { showResetCalibDialog = false }, title = { Text("Resetare Calibrări", fontWeight = FontWeight.Bold, color = Color.Red) }, text = { Text("Atenție! Această acțiune va șterge permanent memoria internă a algoritmului VOC. Senzorul va avea nevoie de 12-24 de ore să se re-calibreze. Aparatul se va restarta automat. Ești sigur?") }, confirmButton = { TextButton(onClick = { showResetCalibDialog = false; onResetCalibrari() }) { Text("Resetare", color = Color.Red) } }, dismissButton = { TextButton(onClick = { showResetCalibDialog = false }) { Text("Anulează", color = textSecondary) } }, containerColor = surfaceColor, titleContentColor = textPrimary, textContentColor = textPrimary)
     }
 
     if (showErrorDialog) {
@@ -1190,32 +1141,28 @@ fun EcranSetari(
                 } else { logEntry.ifBlank { null } }
             }.reversed()
         }
-
-        Dialog(onDismissRequest = { setShowErrorDialog(false) }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Dialog(onDismissRequest = { showErrorDialog = false }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
             Surface(modifier = Modifier.padding(16.dp).fillMaxWidth(), shape = RoundedCornerShape(16.dp), color = surfaceColor) {
                 Column(modifier = Modifier.padding(24.dp)) {
                     Text("Jurnal Erori (24h)", fontWeight = FontWeight.Bold, color = textPrimary, fontSize = 20.sp)
                     Spacer(modifier = Modifier.height(16.dp))
                     LazyColumn(modifier = Modifier.weight(1f, fill = false)) {
-                        if (parsedErrors.isEmpty()) {
-                            item { Text("Sistemul funcționează perfect! Nicio eroare.", color = Color.Green) }
-                        } else {
-                            items(parsedErrors) { err ->
-                                val errColor = when {
-                                    err.contains("Calibrare VOC", ignoreCase = true) -> textPrimary
-                                    err.contains("Curatare", ignoreCase = true) || err.contains("Offset", ignoreCase = true) -> Color(0xFFFFFF0A) // Galben
-                                    err.contains("OTA", ignoreCase = true) || err.contains("USB", ignoreCase = true) -> Color(0xFFFF9600) // Portocaliu
-                                    err.contains("refacuta", ignoreCase = true) -> Color(0xFFAF52DE) // Mov
-                                    err.contains("creata", ignoreCase = true) -> Color(0xFF34C759) // Verde
-                                    err.contains("Eroare", ignoreCase = true) || err.contains("WDT", ignoreCase = true) || err.contains("Panic", ignoreCase = true) || err.contains("Blocat", ignoreCase = true) || err.contains("Restart", ignoreCase = true) || err.contains("Pierdut", ignoreCase = true) || err.contains("Deconectat", ignoreCase = true) || err.contains("Fail", ignoreCase = true) -> Color.Red
-                                    else -> Color(0xFF007AFF) // Albastru
-                                }
-                                Text(err, color = errColor, fontSize = 12.sp, modifier = Modifier.padding(bottom = 8.dp))
+                        if (parsedErrors.isEmpty()) { item { Text("Sistemul funcționează perfect! Nicio eroare.", color = Color.Green) } }
+                        else { items(parsedErrors) { err ->
+                            val errColor = when {
+                                err.contains("Calibrare VOC", ignoreCase = true) -> textPrimary
+                                err.contains("Curatare", ignoreCase = true) || err.contains("Offset", ignoreCase = true) -> Color(0xFFFFFF0A)
+                                err.contains("OTA", ignoreCase = true) || err.contains("USB", ignoreCase = true) -> Color(0xFFFF9600)
+                                err.contains("refacuta", ignoreCase = true) -> Color(0xFFAF52DE)
+                                err.contains("creata", ignoreCase = true) -> Color(0xFF34C759)
+                                err.contains("Eroare", ignoreCase = true) || err.contains("WDT", ignoreCase = true) || err.contains("Panic", ignoreCase = true) || err.contains("Blocat", ignoreCase = true) || err.contains("Restart", ignoreCase = true) || err.contains("Pierdut", ignoreCase = true) || err.contains("Deconectat", ignoreCase = true) || err.contains("Fail", ignoreCase = true) -> Color.Red
+                                else -> Color(0xFF007AFF)
                             }
-                        }
+                            Text(err, color = errColor, fontSize = 12.sp, modifier = Modifier.padding(bottom = 8.dp))
+                        }}
                     }
                     Spacer(modifier = Modifier.height(16.dp))
-                    Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) { TextButton(onClick = { setShowErrorDialog(false) }) { Text("Închide", color = textPrimary) } }
+                    Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) { TextButton(onClick = { showErrorDialog = false }) { Text("Închide", color = textPrimary) } }
                 }
             }
         }
@@ -1223,7 +1170,7 @@ fun EcranSetari(
 
     if (showExportDialog) {
         AlertDialog(
-            onDismissRequest = { if (!isExporting) setShowExportDialog(false) },
+            onDismissRequest = { if (!isExporting) showExportDialog = false },
             title = { Text("Exportă Datele (CSV)", fontWeight = FontWeight.Bold) },
             text = {
                 if (isExporting) {
@@ -1232,246 +1179,132 @@ fun EcranSetari(
                     Column(modifier = Modifier.fillMaxWidth()) {
                         Text("Alege ce perioadă dorești să descarci:", color = textPrimary); Spacer(Modifier.height(16.dp))
                         Button(onClick = {
-                            val sb = java.lang.StringBuilder()
-                            sb.append("Minute_In_Urma,PM2.5,CO2_ppm\n")
-                            val maxPuncte = minOf(istoricExportPM.size, istoricExportCO2.size)
-                            for (i in 0 until maxPuncte) { val minAsteptate = (maxPuncte - 1 - i) * 5; sb.append("$minAsteptate,${istoricExportPM[i]},${istoricExportCO2[i]}\n") }
-                            setCsvContentToSave(sb.toString()); exportLauncher.launch("Live_Aer_24h.csv"); setShowExportDialog(false)
+                            val sb = StringBuilder().apply {
+                                append("Minute_In_Urma,PM2.5,CO2_ppm\n")
+                                val maxPuncte = minOf(istoricExportPM.size, istoricExportCO2.size)
+                                for (i in 0 until maxPuncte) { append("${(maxPuncte - 1 - i) * 5},${istoricExportPM[i]},${istoricExportCO2[i]}\n") }
+                            }
+                            csvContentToSave = sb.toString(); exportLauncher.launch("Live_Aer_24h.csv"); showExportDialog = false
                         }, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = surfaceColor, contentColor = textPrimary), border = BorderStroke(1.dp, dividerColor)) { Text("Ultimele 24 de ore (Live)") }
-
                         Spacer(Modifier.height(8.dp))
                         Button(onClick = {
-                            setIsExporting(true)
+                            isExporting = true
                             val db = FirebaseDatabase.getInstance("https://YOUR_PROJECT-default-rtdb.firebasedatabase.app/").getReference("SenzoriAer/Arhiva_Zilnica")
                             db.get().addOnSuccessListener { snapshot ->
-                                val sb = java.lang.StringBuilder()
-                                sb.append("Data,Ora,PM2.5,CO2_ppm,VOC_Index,NOx_Index,Temp_C,Umiditate_RH\n")
-                                for (ziSnap in snapshot.children) {
-                                    val dateStr = ziSnap.key ?: continue
-                                    val pmList = parseIstoric(ziSnap.child("PM25").getValue(String::class.java))
-                                    val co2List = parseIstoric(ziSnap.child("CO2").getValue(String::class.java))
-                                    val vocList = parseIstoric(ziSnap.child("VOC").getValue(String::class.java), true)
-                                    val noxList = parseIstoric(ziSnap.child("NOx").getValue(String::class.java), true)
-                                    val tempList = parseIstoric(ziSnap.child("Temp").getValue(String::class.java))
-                                    val humList = parseIstoric(ziSnap.child("Umid").getValue(String::class.java))
-
-                                    val maxP = pmList.size
-                                    for (i in 0 until maxP) {
-                                        val pm = pmList.getOrNull(i) ?: -999f
-                                        if (pm == -999f) continue
-                                        val co2 = co2List.getOrNull(i) ?: -999f
-                                        val voc = vocList.getOrNull(i) ?: -999f
-                                        val nox = noxList.getOrNull(i) ?: -999f
-                                        val temp = tempList.getOrNull(i) ?: -999f
-                                        val hum = humList.getOrNull(i) ?: -999f
-                                        val totalMin = i * 5
-                                        val ora = String.format(Locale.US, "%02d:%02d", totalMin / 60, totalMin % 60)
-                                        sb.append("$dateStr,$ora,$pm,${co2.toInt()},${voc.toInt()},${nox.toInt()},$temp,$hum\n")
+                                val sb = StringBuilder().apply {
+                                    append("Data,Ora,PM2.5,CO2_ppm,VOC_Index,NOx_Index,Temp_C,Umiditate_RH\n")
+                                    for (ziSnap in snapshot.children) {
+                                        val dateStr = ziSnap.key ?: continue
+                                        val pmList = parseIstoric(ziSnap.child("PM25").getValue(String::class.java))
+                                        val co2List = parseIstoric(ziSnap.child("CO2").getValue(String::class.java))
+                                        val vocList = parseIstoric(ziSnap.child("VOC").getValue(String::class.java), true)
+                                        val noxList = parseIstoric(ziSnap.child("NOx").getValue(String::class.java), true)
+                                        val tempList = parseIstoric(ziSnap.child("Temp").getValue(String::class.java))
+                                        val humList = parseIstoric(ziSnap.child("Umid").getValue(String::class.java))
+                                        for (i in pmList.indices) {
+                                            val pm = pmList.getOrNull(i) ?: -999f; if (pm == -999f) continue
+                                            val totalMin = i * 5
+                                            append("$dateStr,${"%02d:%02d".format(totalMin / 60, totalMin % 60)},$pm,${(co2List.getOrNull(i) ?: -999f).toInt()},${(vocList.getOrNull(i) ?: -999f).toInt()},${(noxList.getOrNull(i) ?: -999f).toInt()},${tempList.getOrNull(i) ?: -999f},${humList.getOrNull(i) ?: -999f}\n")
+                                        }
                                     }
                                 }
-                                setCsvContentToSave(sb.toString()); exportLauncher.launch("Arhiva_Completă_Aer.csv"); setShowExportDialog(false)
-                            }.addOnFailureListener { setIsExporting(false); setShowExportDialog(false) }
+                                csvContentToSave = sb.toString(); exportLauncher.launch("Arhiva_Completă_Aer.csv"); showExportDialog = false
+                            }.addOnFailureListener { isExporting = false; showExportDialog = false }
                         }, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = accentColor, contentColor = Color.White)) { Text("Toată Arhiva Salvată") }
                     }
                 }
             },
-            confirmButton = { TextButton(onClick = { setShowExportDialog(false) }) { Text("Anulează", color = textSecondary) } },
+            confirmButton = { TextButton(onClick = { showExportDialog = false }) { Text("Anulează", color = textSecondary) } },
             containerColor = surfaceColor, titleContentColor = textPrimary
         )
     }
 
-    val (showPmDialog, setShowPmDialog) = remember { mutableStateOf(false) }
-    val (pmVal, setPmVal) = remember { mutableStateOf(prefs.getFloat("alertPm", 35f).toInt().toString()) }
+    var showPmDialog by remember { mutableStateOf(false) }
+    var pmVal by remember { mutableStateOf(prefs.getFloat("alertPm", 35f).toInt().toString()) }
     if (showPmDialog) {
-        AlertDialog(
-            onDismissRequest = { setShowPmDialog(false) },
-            title = { Text("Setare Prag PM2.5", fontWeight = FontWeight.Bold) },
-            text = {
-                OutlinedTextField(
-                    value = pmVal, onValueChange = { setPmVal(it) },
-                    label = { Text("Limită alertă (µg/m³)") }, singleLine = true,
-                    colors = OutlinedTextFieldDefaults.colors(focusedTextColor = textPrimary, unfocusedTextColor = textPrimary, cursorColor = accentColor, focusedBorderColor = accentColor, unfocusedBorderColor = textSecondary, focusedLabelColor = accentColor, unfocusedLabelColor = textSecondary)
-                )
-            },
-            confirmButton = { TextButton(onClick = { pmVal.toFloatOrNull()?.let { prefs.edit(commit=true){putFloat("alertPm", it)} }; setShowPmDialog(false) }) { Text("Salvează", color = accentColor) } },
-            dismissButton = { TextButton(onClick = { setShowPmDialog(false) }) { Text("Anulează", color = textSecondary) } },
-            containerColor = surfaceColor, titleContentColor = textPrimary, textContentColor = textPrimary
-        )
+        AlertDialog(onDismissRequest = { showPmDialog = false }, title = { Text("Setare Prag PM2.5", fontWeight = FontWeight.Bold) }, text = { OutlinedTextField(value = pmVal, onValueChange = { pmVal = it }, label = { Text("Limită alertă (µg/m³)") }, singleLine = true, colors = OutlinedTextFieldDefaults.colors(focusedTextColor = textPrimary, unfocusedTextColor = textPrimary, cursorColor = accentColor, focusedBorderColor = accentColor, unfocusedBorderColor = textSecondary, focusedLabelColor = accentColor, unfocusedLabelColor = textSecondary)) }, confirmButton = { TextButton(onClick = { pmVal.toFloatOrNull()?.let { prefs.edit(commit = true) { putFloat("alertPm", it) } }; showPmDialog = false }) { Text("Salvează", color = accentColor) } }, dismissButton = { TextButton(onClick = { showPmDialog = false }) { Text("Anulează", color = textSecondary) } }, containerColor = surfaceColor, titleContentColor = textPrimary, textContentColor = textPrimary)
     }
 
-    val (showGazeDialog, setShowGazeDialog) = remember { mutableStateOf(false) }
-    val (co2Val, setCo2Val) = remember { mutableStateOf(prefs.getFloat("alertCo2", 1500f).toInt().toString()) }
-    val (vocVal, setVocVal) = remember { mutableStateOf(prefs.getFloat("alertVoc", 250f).toInt().toString()) }
-    val (noxVal, setNoxVal) = remember { mutableStateOf(prefs.getFloat("alertNox", 150f).toInt().toString()) }
+    var showGazeDialog by remember { mutableStateOf(false) }
+    var co2Val by remember { mutableStateOf(prefs.getFloat("alertCo2", 1500f).toInt().toString()) }
+    var vocVal by remember { mutableStateOf(prefs.getFloat("alertVoc", 250f).toInt().toString()) }
+    var noxVal by remember { mutableStateOf(prefs.getFloat("alertNox", 150f).toInt().toString()) }
     if (showGazeDialog) {
-        AlertDialog(
-            onDismissRequest = { setShowGazeDialog(false) },
-            title = { Text("Praguri Alerte Gaze", fontWeight = FontWeight.Bold) },
-            text = {
-                Column {
-                    OutlinedTextField(value = co2Val, onValueChange = { setCo2Val(it) }, label = { Text("CO2 (ppm)") }, singleLine = true, modifier = Modifier.padding(bottom = 8.dp), colors = OutlinedTextFieldDefaults.colors(focusedTextColor = textPrimary, unfocusedTextColor = textPrimary, cursorColor = accentColor, focusedBorderColor = accentColor, unfocusedBorderColor = textSecondary, focusedLabelColor = accentColor, unfocusedLabelColor = textSecondary))
-                    OutlinedTextField(value = vocVal, onValueChange = { setVocVal(it) }, label = { Text("VOC (Index)") }, singleLine = true, modifier = Modifier.padding(bottom = 8.dp), colors = OutlinedTextFieldDefaults.colors(focusedTextColor = textPrimary, unfocusedTextColor = textPrimary, cursorColor = accentColor, focusedBorderColor = accentColor, unfocusedBorderColor = textSecondary, focusedLabelColor = accentColor, unfocusedLabelColor = textSecondary))
-                    OutlinedTextField(value = noxVal, onValueChange = { setNoxVal(it) }, label = { Text("NOx (Index)") }, singleLine = true, colors = OutlinedTextFieldDefaults.colors(focusedTextColor = textPrimary, unfocusedTextColor = textPrimary, cursorColor = accentColor, focusedBorderColor = accentColor, unfocusedBorderColor = textSecondary, focusedLabelColor = accentColor, unfocusedLabelColor = textSecondary))
-                }
-            },
-            confirmButton = { TextButton(onClick = {
-                co2Val.toFloatOrNull()?.let { prefs.edit(commit=true){putFloat("alertCo2", it)} }
-                vocVal.toFloatOrNull()?.let { prefs.edit(commit=true){putFloat("alertVoc", it)} }
-                noxVal.toFloatOrNull()?.let { prefs.edit(commit=true){putFloat("alertNox", it)} }
-                setShowGazeDialog(false)
-            }) { Text("Salvează", color = accentColor) } },
-            dismissButton = { TextButton(onClick = { setShowGazeDialog(false) }) { Text("Anulează", color = textSecondary) } },
-            containerColor = surfaceColor, titleContentColor = textPrimary, textContentColor = textPrimary
-        )
+        AlertDialog(onDismissRequest = { showGazeDialog = false }, title = { Text("Praguri Alerte Gaze", fontWeight = FontWeight.Bold) }, text = { Column { OutlinedTextField(value = co2Val, onValueChange = { co2Val = it }, label = { Text("CO2 (ppm)") }, singleLine = true, modifier = Modifier.padding(bottom = 8.dp), colors = OutlinedTextFieldDefaults.colors(focusedTextColor = textPrimary, unfocusedTextColor = textPrimary, cursorColor = accentColor, focusedBorderColor = accentColor, unfocusedBorderColor = textSecondary, focusedLabelColor = accentColor, unfocusedLabelColor = textSecondary)); OutlinedTextField(value = vocVal, onValueChange = { vocVal = it }, label = { Text("VOC (Index)") }, singleLine = true, modifier = Modifier.padding(bottom = 8.dp), colors = OutlinedTextFieldDefaults.colors(focusedTextColor = textPrimary, unfocusedTextColor = textPrimary, cursorColor = accentColor, focusedBorderColor = accentColor, unfocusedBorderColor = textSecondary, focusedLabelColor = accentColor, unfocusedLabelColor = textSecondary)); OutlinedTextField(value = noxVal, onValueChange = { noxVal = it }, label = { Text("NOx (Index)") }, singleLine = true, colors = OutlinedTextFieldDefaults.colors(focusedTextColor = textPrimary, unfocusedTextColor = textPrimary, cursorColor = accentColor, focusedBorderColor = accentColor, unfocusedBorderColor = textSecondary, focusedLabelColor = accentColor, unfocusedLabelColor = textSecondary)) } }, confirmButton = { TextButton(onClick = { co2Val.toFloatOrNull()?.let { prefs.edit(commit = true) { putFloat("alertCo2", it) } }; vocVal.toFloatOrNull()?.let { prefs.edit(commit = true) { putFloat("alertVoc", it) } }; noxVal.toFloatOrNull()?.let { prefs.edit(commit = true) { putFloat("alertNox", it) } }; showGazeDialog = false }) { Text("Salvează", color = accentColor) } }, dismissButton = { TextButton(onClick = { showGazeDialog = false }) { Text("Anulează", color = textSecondary) } }, containerColor = surfaceColor, titleContentColor = textPrimary, textContentColor = textPrimary)
     }
 
-    val (showNightModeDialog, setShowNightModeDialog) = remember { mutableStateOf(false) }
+    var showNightModeDialog by remember { mutableStateOf(false) }
     if (showNightModeDialog) {
-        val (autoNightMode, setAutoNightMode) = remember { mutableStateOf(prefs.getBoolean("nightModeAuto", false)) }
-        val (startHr, setStartHr) = remember { mutableIntStateOf(prefs.getInt("nmStartHr", 23)) }
-        val (startMin, setStartMin) = remember { mutableIntStateOf(prefs.getInt("nmStartMin", 0)) }
-        val (endHr, setEndHr) = remember { mutableIntStateOf(prefs.getInt("nmEndHr", 7)) }
-        val (endMin, setEndMin) = remember { mutableIntStateOf(prefs.getInt("nmEndMin", 0)) }
-
-        val (localLumin, setLocalLumin) = remember { mutableFloatStateOf(luminozitateServer.toFloat()) }
+        var autoNightMode by remember { mutableStateOf(prefs.getBoolean("nightModeAuto", false)) }
+        var startHr by remember { mutableIntStateOf(prefs.getInt("nmStartHr", 23)) }; var startMin by remember { mutableIntStateOf(prefs.getInt("nmStartMin", 0)) }
+        var endHr by remember { mutableIntStateOf(prefs.getInt("nmEndHr", 7)) }; var endMin by remember { mutableIntStateOf(prefs.getInt("nmEndMin", 0)) }
+        var localLumin by remember { mutableFloatStateOf(luminozitateServer.toFloat()) }
         var isLuminDragging by remember { mutableStateOf(false) }
-
-        // NEW: Local state pentru slider-ul de LED, convertit din 0-255 inapoi in 0-100%
-        val (localLedLumin, setLocalLedLumin) = remember { mutableFloatStateOf((luminozitateLedServer / 2.55f).coerceIn(0f, 100f)) }
+        var localLedLumin by remember { mutableFloatStateOf((luminozitateLedServer / 2.55f).coerceIn(0f, 100f)) }
         var isLedLuminDragging by remember { mutableStateOf(false) }
-
-        LaunchedEffect(luminozitateServer) {
-            if (!isLuminDragging) setLocalLumin(luminozitateServer.toFloat())
-        }
-        LaunchedEffect(luminozitateLedServer) {
-            if (!isLedLuminDragging) setLocalLedLumin((luminozitateLedServer / 2.55f).coerceIn(0f, 100f))
-        }
-
-        val startDialog = TimePickerDialog(context, { _, h, m -> setStartHr(h); setStartMin(m); prefs.edit(commit = true) { putInt("nmStartHr", h); putInt("nmStartMin", m) } }, startHr, startMin, true)
-        val endDialog = TimePickerDialog(context, { _, h, m -> setEndHr(h); setEndMin(m); prefs.edit(commit = true) { putInt("nmEndHr", h); putInt("nmEndMin", m) } }, endHr, endMin, true)
-
+        LaunchedEffect(luminozitateServer) { if (!isLuminDragging) localLumin = luminozitateServer.toFloat() }
+        LaunchedEffect(luminozitateLedServer) { if (!isLedLuminDragging) localLedLumin = (luminozitateLedServer / 2.55f).coerceIn(0f, 100f) }
+        val startDialog = TimePickerDialog(context, { _, h, m -> startHr = h; startMin = m; prefs.edit(commit = true) { putInt("nmStartHr", h); putInt("nmStartMin", m) } }, startHr, startMin, true)
+        val endDialog = TimePickerDialog(context, { _, h, m -> endHr = h; endMin = m; prefs.edit(commit = true) { putInt("nmEndHr", h); putInt("nmEndMin", m) } }, endHr, endMin, true)
         AlertDialog(
-            onDismissRequest = { setShowNightModeDialog(false) },
+            onDismissRequest = { showNightModeDialog = false },
             title = { Text("Setări Ecran & Night Mode", fontWeight = FontWeight.Bold) },
             text = {
                 Column {
                     Text("Luminozitate Ecran: ${localLumin.roundToInt()}%", color = textPrimary, fontSize = 14.sp)
-                    SliderInteligentCustom(
-                        value = localLumin,
-                        valueRange = 0f..100f,
-                        stepSize = 1f,
-                        onValueChange = { isLuminDragging = true; setLocalLumin(it) },
-                        onValueChangeFinished = { finalValue ->
-                            isLuminDragging = false
-                            onLuminozitateChange(finalValue.roundToInt())
-                        },
-                        onDragStateChange = { isLuminDragging = it },
-                        accentColor = accentColor,
-                        textSecondary = textSecondary
-                    )
+                    SliderInteligentCustom(value = localLumin, valueRange = 0f..100f, stepSize = 1f, onValueChange = { isLuminDragging = true; localLumin = it }, onValueChangeFinished = { isLuminDragging = false; onLuminozitateChange(it.roundToInt()) }, onDragStateChange = { isLuminDragging = it }, accentColor = accentColor, textSecondary = textSecondary)
                     Spacer(Modifier.height(16.dp))
-
-                    // NEW: Slider pentru LED (afisam %, salvam in Firebase 0-255)
                     Text("Luminozitate LED: ${localLedLumin.roundToInt()}%", color = textPrimary, fontSize = 14.sp)
-                    SliderInteligentCustom(
-                        value = localLedLumin,
-                        valueRange = 0f..100f,
-                        stepSize = 1f,
-                        onValueChange = { isLedLuminDragging = true; setLocalLedLumin(it) },
-                        onValueChangeFinished = { finalValue ->
-                            isLedLuminDragging = false
-                            onLuminozitateLedChange((finalValue * 2.55f).roundToInt())
-                        },
-                        onDragStateChange = { isLedLuminDragging = it },
-                        accentColor = accentColor,
-                        textSecondary = textSecondary
-                    )
-                    Spacer(Modifier.height(16.dp))
-                    HorizontalDivider(color = dividerColor)
-                    Spacer(Modifier.height(16.dp))
-
+                    SliderInteligentCustom(value = localLedLumin, valueRange = 0f..100f, stepSize = 1f, onValueChange = { isLedLuminDragging = true; localLedLumin = it }, onValueChangeFinished = { isLedLuminDragging = false; onLuminozitateLedChange((it * 2.55f).roundToInt()) }, onDragStateChange = { isLedLuminDragging = it }, accentColor = accentColor, textSecondary = textSecondary)
+                    Spacer(Modifier.height(16.dp)); HorizontalDivider(color = dividerColor); Spacer(Modifier.height(16.dp))
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                         Text("Automatizare Night Mode", color = textPrimary, fontSize = 14.sp, fontWeight = FontWeight.Medium)
-                        Switch(
-                            checked = autoNightMode,
-                            onCheckedChange = { setAutoNightMode(it); prefs.edit(commit = true) { putBoolean("nightModeAuto", it) } },
-                            modifier = Modifier.scale(0.7f).height(24.dp),
-                            colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = accentColor, uncheckedThumbColor = Color(0xFF8E8E93), uncheckedTrackColor = if (surfaceColor == Color.White) Color(0xFFE5E5EA) else Color(0xFF3A3A3C), uncheckedBorderColor = Color.Transparent)
-                        )
+                        Switch(checked = autoNightMode, onCheckedChange = { autoNightMode = it; prefs.edit(commit = true) { putBoolean("nightModeAuto", it) } }, modifier = Modifier.scale(0.7f).height(24.dp), colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = accentColor, uncheckedThumbColor = Color(0xFF8E8E93), uncheckedTrackColor = if (surfaceColor == Color.White) Color(0xFFE5E5EA) else Color(0xFF3A3A3C), uncheckedBorderColor = Color.Transparent))
                     }
                     AnimatedVisibility(visible = autoNightMode) {
                         Column {
                             Spacer(Modifier.height(12.dp))
                             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                                Button(onClick = { startDialog.show() }, colors = ButtonDefaults.buttonColors(containerColor = dividerColor.copy(alpha = 0.3f)), shape = RoundedCornerShape(8.dp), modifier = Modifier.weight(1f).padding(end = 4.dp)) { Text("Start: ${String.format(Locale.US, "%02d:%02d", startHr, startMin)}", color = textPrimary, fontSize = 12.sp) }
-                                Button(onClick = { endDialog.show() }, colors = ButtonDefaults.buttonColors(containerColor = dividerColor.copy(alpha = 0.3f)), shape = RoundedCornerShape(8.dp), modifier = Modifier.weight(1f).padding(start = 4.dp)) { Text("Stop: ${String.format(Locale.US, "%02d:%02d", endHr, endMin)}", color = textPrimary, fontSize = 12.sp) }
+                                Button(onClick = { startDialog.show() }, colors = ButtonDefaults.buttonColors(containerColor = dividerColor.copy(alpha = 0.3f)), shape = RoundedCornerShape(8.dp), modifier = Modifier.weight(1f).padding(end = 4.dp)) { Text("Start: ${"%02d:%02d".format(startHr, startMin)}", color = textPrimary, fontSize = 12.sp) }
+                                Button(onClick = { endDialog.show() }, colors = ButtonDefaults.buttonColors(containerColor = dividerColor.copy(alpha = 0.3f)), shape = RoundedCornerShape(8.dp), modifier = Modifier.weight(1f).padding(start = 4.dp)) { Text("Stop: ${"%02d:%02d".format(endHr, endMin)}", color = textPrimary, fontSize = 12.sp) }
                             }
                         }
                     }
                 }
             },
-            confirmButton = { TextButton(onClick = { setShowNightModeDialog(false) }) { Text("Gata", color = accentColor) } },
+            confirmButton = { TextButton(onClick = { showNightModeDialog = false }) { Text("Gata", color = accentColor) } },
             containerColor = surfaceColor, titleContentColor = textPrimary, textContentColor = textPrimary
         )
     }
 
-    val (showLiveModeDialog, setShowLiveModeDialog) = remember { mutableStateOf(false) }
+    var showLiveModeDialog by remember { mutableStateOf(false) }
     if (showLiveModeDialog) {
-        val (localLivePerm, setLocalLivePerm) = remember { mutableStateOf(prefs.getBoolean("liveModePermanent", false)) }
-        AlertDialog(
-            onDismissRequest = { setShowLiveModeDialog(false) },
-            title = { Text("Comportament Live Mode", fontWeight = FontWeight.Bold) },
-            text = {
-                Column {
-                    Row(modifier = Modifier.fillMaxWidth().clickable { setLocalLivePerm(false) }.padding(vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-                        RadioButton(selected = !localLivePerm, onClick = { setLocalLivePerm(false) }, colors = RadioButtonDefaults.colors(selectedColor = accentColor))
-                        Column(modifier = Modifier.padding(start = 8.dp)) {
-                            Text("Normal (Baterie)", color = textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium)
-                            Text("Se oprește la 10 secunde după ce ieși din aplicație.", color = textSecondary, fontSize = 12.sp)
-                        }
-                    }
-                    Row(modifier = Modifier.fillMaxWidth().clickable { setLocalLivePerm(true) }.padding(vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-                        RadioButton(selected = localLivePerm, onClick = { setLocalLivePerm(true) }, colors = RadioButtonDefaults.colors(selectedColor = accentColor))
-                        Column(modifier = Modifier.padding(start = 8.dp)) {
-                            Text("Permanent (Consum Mare)", color = textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium)
-                            Text("Stă pornit non-stop cât timp e comutatorul activat.", color = textSecondary, fontSize = 12.sp)
-                        }
-                    }
-                }
-            },
-            confirmButton = { TextButton(onClick = { prefs.edit(commit=true){putBoolean("liveModePermanent", localLivePerm)}; setShowLiveModeDialog(false) }) { Text("Salvează", color = accentColor) } },
-            dismissButton = { TextButton(onClick = { setShowLiveModeDialog(false) }) { Text("Anulează", color = textSecondary) } },
-            containerColor = surfaceColor, titleContentColor = textPrimary, textContentColor = textPrimary
-        )
+        var localLivePerm by remember { mutableStateOf(prefs.getBoolean("liveModePermanent", false)) }
+        AlertDialog(onDismissRequest = { showLiveModeDialog = false }, title = { Text("Comportament Live Mode", fontWeight = FontWeight.Bold) }, text = { Column { Row(modifier = Modifier.fillMaxWidth().clickable { localLivePerm = false }.padding(vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) { RadioButton(selected = !localLivePerm, onClick = { localLivePerm = false }, colors = RadioButtonDefaults.colors(selectedColor = accentColor)); Column(modifier = Modifier.padding(start = 8.dp)) { Text("Normal (Baterie)", color = textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium); Text("Se oprește la 10 secunde după ce ieși din aplicație.", color = textSecondary, fontSize = 12.sp) } }; Row(modifier = Modifier.fillMaxWidth().clickable { localLivePerm = true }.padding(vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) { RadioButton(selected = localLivePerm, onClick = { localLivePerm = true }, colors = RadioButtonDefaults.colors(selectedColor = accentColor)); Column(modifier = Modifier.padding(start = 8.dp)) { Text("Permanent (Consum Mare)", color = textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium); Text("Stă pornit non-stop cât timp e comutatorul activat.", color = textSecondary, fontSize = 12.sp) } } } }, confirmButton = { TextButton(onClick = { prefs.edit(commit = true) { putBoolean("liveModePermanent", localLivePerm) }; showLiveModeDialog = false }) { Text("Salvează", color = accentColor) } }, dismissButton = { TextButton(onClick = { showLiveModeDialog = false }) { Text("Anulează", color = textSecondary) } }, containerColor = surfaceColor, titleContentColor = textPrimary, textContentColor = textPrimary)
     }
 
     Column(modifier = Modifier.fillMaxSize().padding(16.dp).verticalScroll(rememberScrollState())) {
-
         Text("1. PERSONALIZARE INTERFAȚĂ", color = textSecondary, fontSize = 12.sp, fontWeight = FontWeight.Bold); Spacer(modifier = Modifier.height(12.dp))
-
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.clickable { onThemeChange(false) }) {
-                Box(modifier = Modifier.size(130.dp, 90.dp).clip(RoundedCornerShape(16.dp)).background(Color(0xFFF2F2F7)).border(if (!isDarkMode) 3.dp else 1.dp, if (!isDarkMode) accentColor else Color.LightGray.copy(alpha=0.5f), RoundedCornerShape(16.dp)).padding(12.dp)) {
-                    Column { Box(modifier = Modifier.fillMaxWidth().height(16.dp).clip(RoundedCornerShape(4.dp)).background(Color.White)); Spacer(Modifier.height(12.dp)); Row(verticalAlignment = Alignment.CenterVertically) { Box(modifier = Modifier.size(12.dp).clip(CircleShape).background(accentColor)); Spacer(Modifier.width(8.dp)); Box(modifier = Modifier.width(40.dp).height(8.dp).clip(RoundedCornerShape(4.dp)).background(Color.LightGray)) } }
-                }
+            Box(modifier = Modifier.size(130.dp, 90.dp).clip(RoundedCornerShape(16.dp)).background(Color(0xFFF2F2F7)).border(if (!isDarkMode) 3.dp else 1.dp, if (!isDarkMode) accentColor else Color.LightGray.copy(alpha = 0.5f), RoundedCornerShape(16.dp)).padding(12.dp).clickable { onThemeChange(false) }) {
+                Column { Box(modifier = Modifier.fillMaxWidth().height(16.dp).clip(RoundedCornerShape(4.dp)).background(Color.White)); Spacer(Modifier.height(12.dp)); Row(verticalAlignment = Alignment.CenterVertically) { Box(modifier = Modifier.size(12.dp).clip(CircleShape).background(accentColor)); Spacer(Modifier.width(8.dp)); Box(modifier = Modifier.width(40.dp).height(8.dp).clip(RoundedCornerShape(4.dp)).background(Color.LightGray)) } }
             }
-            Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.clickable { onThemeChange(true) }) {
-                Box(modifier = Modifier.size(130.dp, 90.dp).clip(RoundedCornerShape(16.dp)).background(Color(0xFF121212)).border(if (isDarkMode) 3.dp else 1.dp, if (isDarkMode) accentColor else Color.DarkGray.copy(alpha=0.5f), RoundedCornerShape(16.dp)).padding(12.dp)) {
-                    Column { Box(modifier = Modifier.fillMaxWidth().height(16.dp).clip(RoundedCornerShape(4.dp)).background(Color(0xFF2C2C2E))); Spacer(Modifier.height(12.dp)); Row(verticalAlignment = Alignment.CenterVertically) { Box(modifier = Modifier.size(12.dp).clip(CircleShape).background(accentColor)); Spacer(Modifier.width(8.dp)); Box(modifier = Modifier.width(40.dp).height(8.dp).clip(RoundedCornerShape(4.dp)).background(Color.Gray)) } }
-                }
+            Box(modifier = Modifier.size(130.dp, 90.dp).clip(RoundedCornerShape(16.dp)).background(Color(0xFF121212)).border(if (isDarkMode) 3.dp else 1.dp, if (isDarkMode) accentColor else Color.DarkGray.copy(alpha = 0.5f), RoundedCornerShape(16.dp)).padding(12.dp).clickable { onThemeChange(true) }) {
+                Column { Box(modifier = Modifier.fillMaxWidth().height(16.dp).clip(RoundedCornerShape(4.dp)).background(Color(0xFF2C2C2E))); Spacer(Modifier.height(12.dp)); Row(verticalAlignment = Alignment.CenterVertically) { Box(modifier = Modifier.size(12.dp).clip(CircleShape).background(accentColor)); Spacer(Modifier.width(8.dp)); Box(modifier = Modifier.width(40.dp).height(8.dp).clip(RoundedCornerShape(4.dp)).background(Color.Gray)) } }
             }
         }
-
         Spacer(modifier = Modifier.height(12.dp))
-        Row(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(surfaceColor).padding(16.dp), horizontalArrangement = Arrangement.SpaceAround) { culoriDisponibile.forEach { (colorInt, _) -> val isSelected = accentColor == Color(colorInt); Box(modifier = Modifier.size(40.dp).clip(CircleShape).background(Color(colorInt)).border(width = if (isSelected) 3.dp else 0.dp, color = if (isSelected) textPrimary else Color.Transparent, shape = CircleShape).clickable { onColorChange(colorInt) }) } }
-
+        Row(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(surfaceColor).padding(16.dp), horizontalArrangement = Arrangement.SpaceAround) {
+            culoriDisponibile.forEach { (colorInt, _) -> Box(modifier = Modifier.size(40.dp).clip(CircleShape).background(Color(colorInt)).border(width = if (accentColor == Color(colorInt)) 3.dp else 0.dp, color = if (accentColor == Color(colorInt)) textPrimary else Color.Transparent, shape = CircleShape).clickable { onColorChange(colorInt) }) }
+        }
         Spacer(modifier = Modifier.height(12.dp))
-        Row(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(surfaceColor).padding(8.dp), horizontalArrangement = Arrangement.SpaceBetween) { val optiuni = listOf("Bars", "Spline", "Step"); optiuni.forEachIndexed { index, titlu -> val isSelected = tipGrafic == index; Box(modifier = Modifier.weight(1f).padding(4.dp).clip(RoundedCornerShape(8.dp)).background(if (isSelected) accentColor else Color.Transparent).clickable { onTipGraficChange(index) }.padding(vertical = 12.dp), contentAlignment = Alignment.Center) { Text(titlu, color = if (isSelected) Color.White else textPrimary, fontWeight = FontWeight.Medium, fontSize = 14.sp) } } }
-
+        Row(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(surfaceColor).padding(8.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+            listOf("Bars", "Spline", "Step").forEachIndexed { index, titlu ->
+                Box(modifier = Modifier.weight(1f).padding(4.dp).clip(RoundedCornerShape(8.dp)).background(if (tipGrafic == index) accentColor else Color.Transparent).clickable { onTipGraficChange(index) }.padding(vertical = 12.dp), contentAlignment = Alignment.Center) { Text(titlu, color = if (tipGrafic == index) Color.White else textPrimary, fontWeight = FontWeight.Medium, fontSize = 14.sp) }
+            }
+        }
         Spacer(modifier = Modifier.height(12.dp))
-
-        SetareSwitch("Ecran & Night Mode", "Setări luminozitate și programare.", nightModeActiv, accentColor, textPrimary, textSecondary, surfaceColor, onClick = { setShowNightModeDialog(true) }) { onNightModeChange(it) }
-
+        SetareSwitch("Ecran & Night Mode", "Setări luminozitate și programare.", nightModeActiv, accentColor, textPrimary, textSecondary, surfaceColor, onClick = { showNightModeDialog = true }) { onNightModeChange(it) }
         Spacer(modifier = Modifier.height(32.dp))
 
         Row(modifier = Modifier.fillMaxWidth().height(20.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
@@ -1479,97 +1312,56 @@ fun EcranSetari(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("LIVE", color = textSecondary, fontSize = 10.sp, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.width(4.dp))
-                Switch(
-                    checked = liveModeActiv,
-                    onCheckedChange = onLiveModeChange,
-                    modifier = Modifier.scale(0.55f),
-                    colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = accentColor, uncheckedThumbColor = Color(0xFF8E8E93), uncheckedTrackColor = if (surfaceColor == Color.White) Color(0xFFE5E5EA) else Color(0xFF3A3A3C), uncheckedBorderColor = Color.Transparent)
-                )
+                Switch(checked = liveModeActiv, onCheckedChange = onLiveModeChange, modifier = Modifier.scale(0.55f), colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = accentColor, uncheckedThumbColor = Color(0xFF8E8E93), uncheckedTrackColor = if (surfaceColor == Color.White) Color(0xFFE5E5EA) else Color(0xFF3A3A3C), uncheckedBorderColor = Color.Transparent))
             }
         }
         Spacer(modifier = Modifier.height(12.dp))
-
-        Row(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(surfaceColor).clickable { setShowLiveModeDialog(true) }.padding(12.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+        Row(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(surfaceColor).clickable { showLiveModeDialog = true }.padding(12.dp), horizontalArrangement = Arrangement.SpaceBetween) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) { Text("RAM", color = textSecondary, fontSize = 10.sp); Text("${telemetrieRam / 1024} KB", color = textPrimary, fontSize = 14.sp, fontWeight = FontWeight.Bold) }
-            Column(horizontalAlignment = Alignment.CenterHorizontally) { Text("CPU", color = textSecondary, fontSize = 10.sp); Text("${String.format(Locale.US, "%.1f", telemetrieTemp)}°C", color = textPrimary, fontSize = 14.sp, fontWeight = FontWeight.Bold) }
+            Column(horizontalAlignment = Alignment.CenterHorizontally) { Text("CPU", color = textSecondary, fontSize = 10.sp); Text("${"%.1f".format(telemetrieTemp)}°C", color = textPrimary, fontSize = 14.sp, fontWeight = FontWeight.Bold) }
             Column(horizontalAlignment = Alignment.CenterHorizontally) { Text("WiFi", color = textSecondary, fontSize = 10.sp); Text("$telemetrieRssi dBm", color = textPrimary, fontSize = 14.sp, fontWeight = FontWeight.Bold) }
             Column(horizontalAlignment = Alignment.CenterHorizontally) { Text("Uptime", color = textSecondary, fontSize = 10.sp); Text(formatUptime(telemetrieUptime), color = textPrimary, fontSize = 14.sp, fontWeight = FontWeight.Bold) }
         }
         Spacer(modifier = Modifier.height(8.dp))
 
-        Button(onClick = { setShowErrorDialog(true) }, colors = ButtonDefaults.buttonColors(containerColor = surfaceColor), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) { Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Info, contentDescription = "Errors", tint = Color(0xFFFF9500)); Spacer(Modifier.width(16.dp)); Text("Jurnal Erori (Ultimele 24h)", color = textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium) } }
-        Button(onClick = { setShowRestartDialog(true) }, colors = ButtonDefaults.buttonColors(containerColor = surfaceColor), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) { Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Warning, contentDescription = "Restart", tint = Color.Red); Spacer(Modifier.width(16.dp)); Text("Restartare Sistem", color = Color.Red, fontSize = 16.sp, fontWeight = FontWeight.Medium) } }
-        Button(onClick = { setShowResetCalibDialog(true) }, colors = ButtonDefaults.buttonColors(containerColor = surfaceColor), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) { Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Refresh, contentDescription = "Reset VOC", tint = Color(0xFFFF9500)); Spacer(Modifier.width(16.dp)); Text("Resetare Calibrări VOC", color = textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium) } }
-        Button(onClick = { setShowCleanDialog(true) }, colors = ButtonDefaults.buttonColors(containerColor = surfaceColor), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) { Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Settings, contentDescription = "Clean", tint = accentColor); Spacer(Modifier.width(16.dp)); Text("Curățare Senzor SEN66", color = textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium) } }
-        Button(onClick = { setShowExportDialog(true) }, colors = ButtonDefaults.buttonColors(containerColor = surfaceColor), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) { Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Share, contentDescription = "Export", tint = Color(0xFF34C759)); Spacer(Modifier.width(16.dp)); Text("Exportă Datele (.csv)", color = textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium) } }
+        Button(onClick = { showErrorDialog = true }, colors = ButtonDefaults.buttonColors(containerColor = surfaceColor), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) { Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Info, null, tint = Color(0xFFFF9500)); Spacer(Modifier.width(16.dp)); Text("Jurnal Erori (Ultimele 24h)", color = textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium) } }
+        Button(onClick = { showRestartDialog = true }, colors = ButtonDefaults.buttonColors(containerColor = surfaceColor), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) { Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Warning, null, tint = Color.Red); Spacer(Modifier.width(16.dp)); Text("Restartare Sistem", color = Color.Red, fontSize = 16.sp, fontWeight = FontWeight.Medium) } }
+        Button(onClick = { showResetCalibDialog = true }, colors = ButtonDefaults.buttonColors(containerColor = surfaceColor), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) { Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Refresh, null, tint = Color(0xFFFF9500)); Spacer(Modifier.width(16.dp)); Text("Resetare Calibrări VOC", color = textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium) } }
+        Button(onClick = { showCleanDialog = true }, colors = ButtonDefaults.buttonColors(containerColor = surfaceColor), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) { Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Settings, null, tint = accentColor); Spacer(Modifier.width(16.dp)); Text("Curățare Senzor SEN66", color = textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium) } }
+        Button(onClick = { showExportDialog = true }, colors = ButtonDefaults.buttonColors(containerColor = surfaceColor), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) { Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Share, null, tint = Color(0xFF34C759)); Spacer(Modifier.width(16.dp)); Text("Exportă Datele (.csv)", color = textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium) } }
 
-        val (localOffset, setLocalOffset) = remember { mutableFloatStateOf(tempOffsetServer) }
+        var localOffset by remember { mutableFloatStateOf(tempOffsetServer) }
         var isOffsetDragging by remember { mutableStateOf(false) }
-
-        LaunchedEffect(tempOffsetServer) {
-            if (!isOffsetDragging) {
-                setLocalOffset(tempOffsetServer)
-            }
-        }
-
+        LaunchedEffect(tempOffsetServer) { if (!isOffsetDragging) localOffset = tempOffsetServer }
         Column(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(surfaceColor).padding(16.dp)) {
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Text("Offset Temperatură", color = textPrimary, fontSize = 18.sp, fontWeight = FontWeight.Medium)
-                Text("${if(localOffset > 0) "+" else ""}${String.format(Locale.US, "%.1f", localOffset)} °C", color = accentColor, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Text("${if (localOffset > 0) "+" else ""}${"%.1f".format(localOffset)} °C", color = accentColor, fontSize = 18.sp, fontWeight = FontWeight.Bold)
             }
             Text("Compensează căldura radiată de ventilator pentru o citire perfectă.", color = textSecondary, fontSize = 14.sp, modifier = Modifier.padding(top = 4.dp, bottom = 12.dp))
-            SliderInteligentCustom(
-                value = localOffset,
-                valueRange = -3f..3f,
-                stepSize = 0.1f,
-                onValueChange = { isOffsetDragging = true; setLocalOffset(it) },
-                onValueChangeFinished = { finalValue ->
-                    isOffsetDragging = false
-                    onTempOffsetChange(finalValue)
-                },
-                onDragStateChange = { isOffsetDragging = it },
-                accentColor = accentColor,
-                textSecondary = textSecondary
-            )
+            SliderInteligentCustom(value = localOffset, valueRange = -3f..3f, stepSize = 0.1f, onValueChange = { isOffsetDragging = true; localOffset = it }, onValueChangeFinished = { isOffsetDragging = false; onTempOffsetChange(it) }, onDragStateChange = { isOffsetDragging = it }, accentColor = accentColor, textSecondary = textSecondary)
         }
 
         Spacer(modifier = Modifier.height(32.dp))
-
         Text("3. NOTIFICĂRI PUSH", color = textSecondary, fontSize = 12.sp, fontWeight = FontWeight.Bold); Spacer(modifier = Modifier.height(12.dp))
-
-        SetareSwitch("Alerte Praf (PM2.5)", "Te notifică când depășește ${prefs.getFloat("alertPm", 35f).toInt()}.", notifPraf, accentColor, textPrimary, textSecondary, surfaceColor, onClick = { setShowPmDialog(true) }) { onNotifPrafChange(it) }
+        SetareSwitch("Alerte Praf (PM2.5)", "Te notifică când depășește ${prefs.getFloat("alertPm", 35f).toInt()}.", notifPraf, accentColor, textPrimary, textSecondary, surfaceColor, onClick = { showPmDialog = true }) { onNotifPrafChange(it) }
         Spacer(modifier = Modifier.height(8.dp))
-
-        SetareSwitch("Alertă Aerisire", "Când gazele (CO2/VOC/NOx) depășesc pragurile.", notifGaze, accentColor, textPrimary, textSecondary, surfaceColor, onClick = { setShowGazeDialog(true) }) { onNotifGazeChange(it) }
+        SetareSwitch("Alertă Aerisire", "Când gazele (CO2/VOC/NOx) depășesc pragurile.", notifGaze, accentColor, textPrimary, textSecondary, surfaceColor, onClick = { showGazeDialog = true }) { onNotifGazeChange(it) }
         Spacer(modifier = Modifier.height(8.dp))
-
         SetareSwitch("Alertă Deconectare", "Primești notificare când aparatul cade din rețea.", notifOffline, accentColor, textPrimary, textSecondary, surfaceColor) { onNotifOfflineChange(it) }
         Spacer(modifier = Modifier.height(8.dp))
-
         SetareSwitch("Rulare în fundal", "Serviciu pentru primirea alertelor cu aplicația închisă.", runInBackground, accentColor, textPrimary, textSecondary, surfaceColor) { onRunInBackgroundChange(it) }
         Spacer(modifier = Modifier.height(8.dp))
 
         Column(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(surfaceColor).padding(16.dp)) {
-
-            val prefsFreq = ((prefs.getInt("notifFreqMins", 10) / 10f).roundToInt() * 10).toFloat().coerceIn(10f, 120f)
-            val (notifFreq, setNotifFreq) = remember { mutableFloatStateOf(prefsFreq) }
-
+            var notifFreq by remember { mutableFloatStateOf(((prefs.getInt("notifFreqMins", 10) / 10f).roundToInt() * 10).toFloat().coerceIn(10f, 120f)) }
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Text("Pauză Alerte", color = textPrimary, fontSize = 18.sp, fontWeight = FontWeight.Medium)
                 Text("${notifFreq.roundToInt()} min", color = accentColor, fontSize = 18.sp, fontWeight = FontWeight.Bold)
             }
             Text("Timpul de așteptare între notificări pentru a evita spam-ul.", color = textSecondary, fontSize = 14.sp, modifier = Modifier.padding(top = 4.dp, bottom = 12.dp))
-            SliderInteligentCustom(
-                value = notifFreq,
-                valueRange = 10f..120f,
-                stepSize = 10f,
-                onValueChange = { setNotifFreq(it) },
-                onValueChangeFinished = { finalValue -> prefs.edit(commit=true) { putInt("notifFreqMins", finalValue.roundToInt()) } },
-                accentColor = accentColor,
-                textSecondary = textSecondary
-            )
+            SliderInteligentCustom(value = notifFreq, valueRange = 10f..120f, stepSize = 10f, onValueChange = { notifFreq = it }, onValueChangeFinished = { prefs.edit(commit = true) { putInt("notifFreqMins", it.roundToInt()) } }, accentColor = accentColor, textSecondary = textSecondary)
         }
-
         Spacer(modifier = Modifier.height(32.dp))
     }
 }
@@ -1582,43 +1374,31 @@ fun SetareSwitch(titlu: String, descriere: String, checked: Boolean, accentColor
     }
 }
 
-// ================= COMPONENTE GRAFICE ȘI TENDINȚE =================
+// ================= COMPONENTE GRAFICE =================
 @Composable
 fun SenzorCard(
     titlu: String, valoareLive: Float, formatInit: Boolean, istoricTotal: List<Float>, interval: IntervalTimp,
     esteArhiva: Boolean, yMaxCap: Float?, faraZecimale: Boolean, textPrimary: Color, textSecondary: Color,
     tipGrafic: Int, chartId: String, globalTouchIndex: Int?, activeChartId: String?,
     onGlobalTouch: (Int?, String?) -> Unit, trendScheme: TrendScheme, trendValue: Int, lastHistoryTimeUnix: Long,
-    douaZecimaleLive: Boolean = false, // NEW: Optional parameter for 2 decimals
-    colorLogic: (Float) -> Color
+    douaZecimaleLive: Boolean = false, colorLogic: (Float) -> Color
 ) {
     val currentUnix = System.currentTimeMillis() / 1000
-    var intervaleLipsa = 0
-    if (!esteArhiva && lastHistoryTimeUnix > 0) {
-        intervaleLipsa = ((currentUnix - lastHistoryTimeUnix) / 300).toInt().coerceAtLeast(0)
-    }
+    val intervaleLipsa = if (!esteArhiva && lastHistoryTimeUnix > 0) ((currentUnix - lastHistoryTimeUnix) / 300).toInt().coerceAtLeast(0) else 0
 
     val istoricTaiat = remember(istoricTotal, intervaleLipsa, interval) {
-        val istoricPadded = if (intervaleLipsa > 0 && intervaleLipsa < interval.puncte) {
-            istoricTotal + List(intervaleLipsa) { -999f }
-        } else {
-            istoricTotal
-        }
-        istoricPadded.takeLast(interval.puncte)
+        val padded = if (intervaleLipsa > 0 && intervaleLipsa < interval.puncte) istoricTotal + List(intervaleLipsa) { -999f } else istoricTotal
+        padded.takeLast(interval.puncte)
     }
-
     val anchorUnix = if (esteArhiva) 0L else if (lastHistoryTimeUnix > 0) lastHistoryTimeUnix + (intervaleLipsa * 300L) else currentUnix
 
     Column(modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp)) {
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
             Text(titlu, color = textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium)
             Row(verticalAlignment = Alignment.CenterVertically) {
-                val valoareCurenta = istoricTotal.lastOrNull() ?: 0f
-                val displayColor = if (formatInit || (esteArhiva && valoareCurenta == -999f)) textSecondary else colorLogic(valoareLive)
-
+                val displayColor = if (formatInit || (esteArhiva && (istoricTotal.lastOrNull() ?: 0f) == -999f)) textSecondary else colorLogic(valoareLive)
                 if (!esteArhiva && !formatInit) {
-                    val isNeutral = trendValue == 0
-                    val isUp = trendValue > 0
+                    val isNeutral = trendValue == 0; val isUp = trendValue > 0
                     val arrowColor = when {
                         isNeutral -> textSecondary
                         trendScheme == TrendScheme.POLLUTANTS -> if (isUp) Color(0xFFE53935) else Color(0xFF43A047)
@@ -1627,14 +1407,11 @@ fun SenzorCard(
                         else -> textSecondary
                     }
                     Box(contentAlignment = Alignment.Center, modifier = Modifier.padding(end = 6.dp).height(24.dp)) {
-                        if (isNeutral) { Text(text = "-", color = arrowColor, fontSize = 24.sp, fontWeight = FontWeight.Bold) }
-                        else { Text(text = "^", color = arrowColor, fontSize = 18.sp, fontWeight = FontWeight.Black, modifier = Modifier.rotate(if (isUp) 0f else 180f)) }
+                        if (isNeutral) Text("-", color = arrowColor, fontSize = 24.sp, fontWeight = FontWeight.Bold)
+                        else Text("^", color = arrowColor, fontSize = 18.sp, fontWeight = FontWeight.Black, modifier = Modifier.rotate(if (isUp) 0f else 180f))
                     }
                 }
-
-                // MODIFICAT AICI: Logica pentru afișarea cu 2 zecimale, dacă parametrul este activat
-                val stringValoare = if (esteArhiva) "-" else if (formatInit) "Init" else if (faraZecimale) valoareLive.roundToInt().toString() else if (douaZecimaleLive) String.format(Locale.US, "%.2f", valoareLive) else String.format(Locale.US, "%.1f", valoareLive)
-
+                val stringValoare = if (esteArhiva) "-" else if (formatInit) "Init" else if (faraZecimale) valoareLive.roundToInt().toString() else if (douaZecimaleLive) "%.2f".format(valoareLive) else "%.1f".format(valoareLive)
                 if (!esteArhiva) Text(stringValoare, color = displayColor, fontSize = 18.sp, fontWeight = FontWeight.Bold)
             }
         }
@@ -1652,16 +1429,16 @@ fun GraficAvansat(
 ) {
     if (istoric.isEmpty()) { Text("Colectare date...", color = textSecondary, fontSize = 12.sp); return }
 
-    val istoricValid = istoric.filter { it != -999f }
+    val istoricValid = remember(istoric) { istoric.filter { it != -999f } }
     var maxVal = (istoricValid.maxOrNull() ?: 1f) * 1.1f
     var minVal = (istoricValid.minOrNull() ?: 0f) * 0.9f
     if (yMaxCap != null && maxVal > yMaxCap) maxVal = yMaxCap
     if (minVal < 0f) minVal = 0f
     val range = if (maxVal == minVal) 1f else maxVal - minVal
-
     val maxPuncte = interval.puncte
     val offsetStartIndex = maxPuncte - istoric.size
 
+    // Paint-urile sunt memoizate corect
     val bgPaint = remember { android.graphics.Paint().apply { color = android.graphics.Color.DKGRAY; alpha = 230; style = android.graphics.Paint.Style.FILL } }
     val etichetaYPaint = remember(textSecondary) { android.graphics.Paint().apply { color = android.graphics.Color.GRAY; textSize = 28f; textAlign = android.graphics.Paint.Align.RIGHT } }
     val etichetaXPaint = remember { android.graphics.Paint().apply { color = android.graphics.Color.GRAY; textSize = 28f; textAlign = android.graphics.Paint.Align.CENTER } }
@@ -1670,36 +1447,19 @@ fun GraficAvansat(
     val tooltipTimpPaint = remember { android.graphics.Paint().apply { color = android.graphics.Color.WHITE; textSize = 24f; textAlign = android.graphics.Paint.Align.CENTER; typeface = android.graphics.Typeface.DEFAULT_BOLD } }
 
     Canvas(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(120.dp)
-            .padding(start = 30.dp, bottom = 20.dp, end = 10.dp, top = 10.dp)
+        modifier = Modifier.fillMaxWidth().height(120.dp).padding(start = 30.dp, bottom = 20.dp, end = 10.dp, top = 10.dp)
             .pointerInput(chartId, maxPuncte) {
                 detectDragGestures(
-                    onDragStart = { offset: Offset ->
-                        val distantaX = size.width / (maxPuncte - 1).coerceAtLeast(1).toFloat()
-                        val idx = (offset.x / distantaX).roundToInt().coerceIn(0, maxPuncte - 1)
-                        onGlobalTouch(idx, chartId)
-                    },
-                    onDragEnd = { onGlobalTouch(null, null) },
-                    onDragCancel = { onGlobalTouch(null, null) },
-                    onDrag = { change: PointerInputChange, _: Offset ->
-                        val distantaX = size.width / (maxPuncte - 1).coerceAtLeast(1).toFloat()
-                        val idx = (change.position.x / distantaX).roundToInt().coerceIn(0, maxPuncte - 1)
-                        onGlobalTouch(idx, chartId)
-                    }
+                    onDragStart = { offset -> onGlobalTouch((offset.x / (size.width / (maxPuncte - 1).coerceAtLeast(1).toFloat())).roundToInt().coerceIn(0, maxPuncte - 1), chartId) },
+                    onDragEnd = { onGlobalTouch(null, null) }, onDragCancel = { onGlobalTouch(null, null) },
+                    onDrag = { change, _ -> onGlobalTouch((change.position.x / (size.width / (maxPuncte - 1).coerceAtLeast(1).toFloat())).roundToInt().coerceIn(0, maxPuncte - 1), chartId) }
                 )
             }
             .pointerInput(chartId, maxPuncte) {
-                detectTapGestures(
-                    onPress = { offset: Offset ->
-                        val distantaX = size.width / (maxPuncte - 1).coerceAtLeast(1).toFloat()
-                        val idx = (offset.x / distantaX).roundToInt().coerceIn(0, maxPuncte - 1)
-                        onGlobalTouch(idx, chartId)
-                        tryAwaitRelease()
-                        onGlobalTouch(null, null)
-                    }
-                )
+                detectTapGestures(onPress = { offset ->
+                    onGlobalTouch((offset.x / (size.width / (maxPuncte - 1).coerceAtLeast(1).toFloat())).roundToInt().coerceIn(0, maxPuncte - 1), chartId)
+                    tryAwaitRelease(); onGlobalTouch(null, null)
+                })
             }
     ) {
         val w = size.width; val h = size.height
@@ -1707,49 +1467,40 @@ fun GraficAvansat(
 
         for (i in 0 until 3) {
             val yPos = h - (i * (h / 2)); val valoareEticheta = minVal + (i * (range / 2))
-            val etichetaText = if (faraZecimale) { String.format(Locale.US, "%.0f", valoareEticheta) } else { if (range < 5f) String.format(Locale.US, "%.1f", valoareEticheta) else String.format(Locale.US, "%.0f", valoareEticheta) }
+            val etichetaText = if (faraZecimale) "%.0f".format(valoareEticheta) else if (range < 5f) "%.1f".format(valoareEticheta) else "%.0f".format(valoareEticheta)
             drawLine(textSecondary.copy(alpha = 0.3f), Offset(0f, yPos), Offset(w, yPos), strokeWidth = 2f)
             drawContext.canvas.nativeCanvas.drawText(etichetaText, -10f, yPos + 10f, etichetaYPaint)
         }
-
         for (i in 0..4) {
             val xPos = i * (w / 4)
-            val eticheta = if (esteArhiva) { arrayOf("00:00", "06:00", "12:00", "18:00", "24:00")[i] } else {
-                val oreInUrma = interval.ore - (i * (interval.ore / 4f))
-                if (oreInUrma == 0f) "Acum" else "-${String.format(Locale.US, "%.0f", oreInUrma)}h"
-            }
+            val eticheta = if (esteArhiva) arrayOf("00:00", "06:00", "12:00", "18:00", "24:00")[i]
+            else { val ore = interval.ore - (i * (interval.ore / 4f)); if (ore == 0f) "Acum" else "-${("%.0f".format(ore))}h" }
             drawContext.canvas.nativeCanvas.drawText(eticheta, xPos, h + 40f, etichetaXPaint)
         }
 
-        if (tipGrafic == 0) { // Bars
+        if (tipGrafic == 0) {
             for (i in istoric.indices) { val v = istoric[i]; if (v == -999f) continue; val x = (offsetStartIndex + i) * distantaX; val baseRectTop = h - ((v - minVal) / range) * h; val rectTop = baseRectTop.coerceAtMost(h - 4f); val barWidth = (distantaX * 0.7f).coerceIn(4f, 20f); drawRoundRect(color = colorLogic(v), topLeft = Offset(x - barWidth / 2, rectTop), size = Size(barWidth, h - rectTop), cornerRadius = CornerRadius(barWidth / 2, barWidth / 2)) }
-        } else if (tipGrafic == 1 || tipGrafic == 2) { // Spline or Step
+        } else if (tipGrafic == 1 || tipGrafic == 2) {
             var fillPath: Path? = null; var startX = 0f; var lastX = 0f
             for (i in 0 until istoric.size - 1) {
-                val val1 = istoric[i]; val val2 = istoric[i+1]
+                val val1 = istoric[i]; val val2 = istoric[i + 1]
                 if (val1 == -999f || val2 == -999f) {
-                    if (fillPath != null) { fillPath.lineTo(lastX, h); fillPath.lineTo(startX, h); fillPath.close(); drawPath(fillPath, brush = Brush.verticalGradient(listOf(colorLogic(maxVal).copy(alpha=0.7f), colorLogic(minVal).copy(alpha=0.1f)), startY = 0f, endY = h)); fillPath = null }
+                    if (fillPath != null) { fillPath.lineTo(lastX, h); fillPath.lineTo(startX, h); fillPath.close(); drawPath(fillPath, brush = Brush.verticalGradient(listOf(colorLogic(maxVal).copy(alpha = 0.7f), colorLogic(minVal).copy(alpha = 0.1f)), startY = 0f, endY = h)); fillPath = null }
                     continue
                 }
                 val x1 = (offsetStartIndex + i) * distantaX; val y1 = h - ((val1 - minVal) / range) * h
                 val x2 = (offsetStartIndex + i + 1) * distantaX; val y2 = h - ((val2 - minVal) / range) * h
-
                 if (fillPath == null) { fillPath = Path().apply { moveTo(x1, y1) }; startX = x1 }
-                if (tipGrafic == 1) { // Spline
-                    val cx = (x1 + x2) / 2f
-                    fillPath.cubicTo(cx, y1, cx, y2, x2, y2)
-                    val strokeSegment = Path().apply { moveTo(x1, y1); cubicTo(cx, y1, cx, y2, x2, y2) }
-                    drawPath(strokeSegment, color = colorLogic(val2), style = Stroke(6f, cap = StrokeCap.Round))
-                } else
-                { // Step
-                    fillPath.lineTo(x2, y1)
-                    fillPath.lineTo(x2, y2)
-                    val strokeSegment = Path().apply { moveTo(x1, y1); lineTo(x2, y1); lineTo(x2, y2) }
-                    drawPath(strokeSegment, color = colorLogic(val2), style = Stroke(6f, cap = StrokeCap.Round))
+                if (tipGrafic == 1) {
+                    val cx = (x1 + x2) / 2f; fillPath.cubicTo(cx, y1, cx, y2, x2, y2)
+                    drawPath(Path().apply { moveTo(x1, y1); cubicTo(cx, y1, cx, y2, x2, y2) }, color = colorLogic(val2), style = Stroke(6f, cap = StrokeCap.Round))
+                } else {
+                    fillPath.lineTo(x2, y1); fillPath.lineTo(x2, y2)
+                    drawPath(Path().apply { moveTo(x1, y1); lineTo(x2, y1); lineTo(x2, y2) }, color = colorLogic(val2), style = Stroke(6f, cap = StrokeCap.Round))
                 }
                 lastX = x2
             }
-            if (fillPath != null) { fillPath.lineTo(lastX, h); fillPath.lineTo(startX, h); fillPath.close(); drawPath(fillPath, brush = Brush.verticalGradient(listOf(colorLogic(maxVal).copy(alpha=0.8f), colorLogic(minVal).copy(alpha=0.15f)), startY = 0f, endY = h)) }
+            if (fillPath != null) { fillPath.lineTo(lastX, h); fillPath.lineTo(startX, h); fillPath.close(); drawPath(fillPath, brush = Brush.verticalGradient(listOf(colorLogic(maxVal).copy(alpha = 0.8f), colorLogic(minVal).copy(alpha = 0.15f)), startY = 0f, endY = h)) }
         }
 
         if (!esteArhiva) {
@@ -1757,32 +1508,31 @@ fun GraficAvansat(
             val midnightUnix = LocalDate.now(zone).atStartOfDay(zone).toEpochSecond()
             val pointsSinceMidnight = ((anchorUnix - midnightUnix) / 300).toInt()
             val midnightIndex = interval.puncte - 1 - pointsSinceMidnight
-            if (midnightIndex in 0 until interval.puncte) { val xMidnight = midnightIndex * distantaX; drawLine(color = textSecondary.copy(alpha = 0.5f), start = Offset(xMidnight, 0f), end = Offset(xMidnight, h), strokeWidth = 2f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 10f), 0f)); drawContext.canvas.nativeCanvas.drawText("00:00", xMidnight, 15f, zeroEtichetaPaint) }
+            if (midnightIndex in 0 until interval.puncte) {
+                val xMidnight = midnightIndex * distantaX
+                drawLine(color = textSecondary.copy(alpha = 0.5f), start = Offset(xMidnight, 0f), end = Offset(xMidnight, h), strokeWidth = 2f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 10f), 0f))
+                drawContext.canvas.nativeCanvas.drawText("00:00", xMidnight, 15f, zeroEtichetaPaint)
+            }
         }
 
         globalTouchIndex?.let { touchIndexGlobal ->
             val indexInIstoric = touchIndexGlobal - offsetStartIndex
             if (indexInIstoric in istoric.indices && istoric[indexInIstoric] != -999f) {
                 val xFix = touchIndexGlobal * distantaX; val valoareTouch = istoric[indexInIstoric]; val yFix = h - ((valoareTouch - minVal) / range) * h
-
                 drawLine(textPrimary.copy(alpha = 0.6f), Offset(xFix, 0f), Offset(xFix, h), strokeWidth = 3f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 10f), 0f))
                 drawCircle(textPrimary, 12f, Offset(xFix, yFix)); drawCircle(colorLogic(valoareTouch), 8f, Offset(xFix, yFix))
-
-                val textToDraw = if (faraZecimale) String.format(Locale.US, "%.0f", valoareTouch) else String.format(Locale.US, "%.1f", valoareTouch)
+                val textToDraw = if (faraZecimale) "%.0f".format(valoareTouch) else "%.1f".format(valoareTouch)
                 var tooltipY = yFix - 45f; if (tooltipY < -10f) tooltipY = yFix + 60f
                 drawContext.canvas.nativeCanvas.drawRoundRect(android.graphics.RectF(xFix - 50f, tooltipY - 35f, xFix + 50f, tooltipY + 15f), 12f, 12f, bgPaint)
                 drawContext.canvas.nativeCanvas.drawText(textToDraw, xFix, tooltipY, tooltipValoarePaint)
-
                 if (activeChartId == chartId) {
-                    val timpTouchString = if (esteArhiva) {
-                        val totalMin = indexInIstoric * 5
-                        String.format(Locale.US, "%02d:%02d", totalMin / 60, totalMin % 60)
-                    } else {
+                    val timpTouchString = if (esteArhiva) { val totalMin = indexInIstoric * 5; "%02d:%02d".format(totalMin / 60, totalMin % 60) }
+                    else {
                         val pointUnix = anchorUnix - (maxPuncte - 1 - touchIndexGlobal) * 300L
                         val dateTime = Instant.ofEpochSecond(pointUnix).atZone(ZoneId.systemDefault())
                         val roundedMinute = (dateTime.minute / 5.0).roundToInt() * 5
                         val finalTime = if (roundedMinute == 60) dateTime.plusHours(1).withMinute(0) else dateTime.withMinute(roundedMinute)
-                        String.format(Locale.US, "%02d:%02d", finalTime.hour, finalTime.minute)
+                        "%02d:%02d".format(finalTime.hour, finalTime.minute)
                     }
                     val timeBubbleY = h + 25f
                     drawContext.canvas.nativeCanvas.drawRoundRect(android.graphics.RectF(xFix - 45f, timeBubbleY - 20f, xFix + 45f, timeBubbleY + 10f), 8f, 8f, bgPaint)
