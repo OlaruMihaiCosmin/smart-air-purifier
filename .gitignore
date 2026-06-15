@@ -1,0 +1,22 @@
+# ===== Date private — NU se comit niciodată =====
+firmware/secrete.h
+android/secrete.properties
+android/app/google-services.json
+android/local.properties
+
+# ===== Android / Gradle =====
+android/.gradle/
+android/build/
+android/app/build/
+android/captures/
+android/.idea/
+*.iml
+.cxx/
+.externalNativeBuild/
+
+# ===== Arduino =====
+firmware/build/
+
+# ===== Diverse =====
+.DS_Store
+*.log

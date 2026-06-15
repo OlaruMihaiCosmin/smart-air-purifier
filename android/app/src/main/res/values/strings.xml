@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Smart Air</string>
+    <string name="widget_pm_desc">Indicator PM</string>
+    <string name="widget_co2_desc">Indicator CO2</string>
+</resources>

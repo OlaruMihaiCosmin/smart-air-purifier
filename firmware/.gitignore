@@ -1,0 +1,3 @@
+# Datele private (WiFi, Firebase, FCM, OTA) — nu ajung in repo.
+# Pentru un clone proaspat: copiaza secrete.h.example ca secrete.h.
+secrete.h

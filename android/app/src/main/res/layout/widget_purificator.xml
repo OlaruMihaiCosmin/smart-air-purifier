@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/widget_bg"
+    android:gravity="center"
+    android:orientation="horizontal"
+    android:paddingHorizontal="10.2dp"
+    android:paddingVertical="17dp">
+
+    <!-- fitCenter (nu centerInside) ca sa MARESCA bitmapul pana umple zona, eliminand
+         spatiul gol din jurul cadranelor pe ecrane mai mari decat rezolutia bitmapului. -->
+    <ImageView
+        android:id="@+id/iv_widget_pm"
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1"
+        android:contentDescription="@string/widget_pm_desc"
+        android:scaleType="fitCenter" />
+
+    <ImageView
+        android:id="@+id/iv_widget_co2"
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1"
+        android:contentDescription="@string/widget_co2_desc"
+        android:scaleType="fitCenter" />
+
+</LinearLayout>

@@ -1,11 +1,10 @@
-﻿@file:Suppress("SpellCheckingInspection")
+@file:Suppress("SpellCheckingInspection", "AssignedValueIsNeverRead")
 
 package com.example.smartpurifier
 
 import android.Manifest
 import android.app.NotificationChannel
 import android.app.NotificationManager
-import android.app.Service
 import android.app.TimePickerDialog
 import android.appwidget.AppWidgetManager
 import android.appwidget.AppWidgetProvider
@@ -14,10 +13,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
-import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.Bundle
-import android.os.IBinder
 import android.util.Log
 import android.widget.RemoteViews
 import androidx.activity.ComponentActivity
@@ -46,6 +43,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.DateRange
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Info
@@ -86,17 +85,32 @@ import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.edit
+import androidx.work.Constraints
+import androidx.work.CoroutineWorker
+import androidx.work.ExistingPeriodicWorkPolicy
+import androidx.work.NetworkType
+import androidx.work.PeriodicWorkRequestBuilder
+import androidx.work.WorkManager
+import androidx.work.WorkerParameters
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.database.DataSnapshot
 import com.google.firebase.database.DatabaseError
 import com.google.firebase.database.DatabaseReference
 import com.google.firebase.database.FirebaseDatabase
 import com.google.firebase.database.ValueEventListener
+import com.google.firebase.messaging.FirebaseMessaging
+import com.google.firebase.messaging.FirebaseMessagingService
+import com.google.firebase.messaging.RemoteMessage
 import kotlinx.coroutines.*
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
+import java.util.concurrent.TimeUnit
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import java.time.DayOfWeek
 import java.time.Instant
 import java.time.LocalDate
-import java.time.LocalTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import kotlin.math.roundToInt
@@ -104,11 +118,11 @@ import kotlin.math.roundToInt
 // ================= ENUMERĂRI ȘI VARIABILE GLOBALE =================
 enum class IntervalTimp(val ore: Int, val puncte: Int) { ORE_4(4, 48), ORE_12(12, 144), ORE_24(24, 288) }
 val culoriDisponibile = listOf(
-    0xFF007AFF.toInt() to "Albastru",
-    0xFF00E676.toInt() to "Verde",
-    0xFFFF9500.toInt() to "Portocaliu",
-    0xFFFF2D55.toInt() to "Roșu",
-    0xFFAF52DE.toInt() to "Mov"
+    0xFF367AFF.toInt() to "Albastru",
+    0xFFA53DDA.toInt() to "Mov",
+    0xFFD62D20.toInt() to "Roșu",
+    0xFFF09000.toInt() to "Portocaliu",
+    0xFF008744.toInt() to "Verde",
 )
 enum class TrendScheme { POLLUTANTS, TEMPERATURE, HUMIDITY }
 
@@ -131,29 +145,54 @@ fun parseIstoric(data: String?, isIndex: Boolean = false): List<Float> {
     }
 }
 
+// Gradient continuu pe ancore (stil bara meteo): fiecare ancora (valoare -> culoare)
+// marcheaza centrul unei benzi cu culoarea ei "pura"; intre ancore se interpoleaza
+// liniar. Sub prima / peste ultima ancora, culoarea ramane fixa.
+private fun gradientPeAncore(v: Float, ancore: List<Pair<Float, Color>>): Color {
+    if (v <= ancore.first().first) return ancore.first().second
+    if (v >= ancore.last().first) return ancore.last().second
+    for (i in 0 until ancore.size - 1) {
+        val (v2, c2) = ancore[i + 1]
+        if (v <= v2) {
+            val (v1, c1) = ancore[i]
+            return androidx.compose.ui.graphics.lerp(c1, c2, ((v - v1) / (v2 - v1)).coerceIn(0f, 1f))
+        }
+    }
+    return ancore.last().second
+}
+
+// Temperatura, adaptata intervalului dintr-un apartament (~16-30°C):
+// sub 16 mov arctic, 16-18 albastru, 18-22 verde (ideal), 22-24 galben,
+// 24-26 portocaliu, 26-30 rosu, 30+ rosu intens — cu gradient intre benzi.
+private val ancoreTemperatura = listOf(
+    16f to Color(0xFF6559C8),   // mov arctic (frig sever)
+    18f to Color(0xFF1E88E5),   // albastru (racoare)
+    21f to Color(0xFF43A047),   // verde (confort ideal)
+    23f to Color(0xFFFDD835),   // galben (caldut)
+    25f to Color(0xFFFB8C00),   // portocaliu (cald)
+    27f to Color(0xFFE53935),   // rosu (prea cald)
+    29f to Color(0xFFB71C1C)    // rosu intens (canicula)
+)
+
 fun getTempColor(v: Float): Color {
     if (v == -999f) return Color.Transparent
-    return when {
-        v <= 16f -> Color(0xFF0D47A1)
-        v <= 20f -> androidx.compose.ui.graphics.lerp(Color(0xFF0D47A1), Color(0xFF4CAF50), ((v - 16f) / 4f).coerceIn(0f, 1f))
-        v <= 23f -> androidx.compose.ui.graphics.lerp(Color(0xFF4CAF50), Color(0xFFFBC02D), ((v - 20f) / 3f).coerceIn(0f, 1f))
-        v <= 26f -> androidx.compose.ui.graphics.lerp(Color(0xFFFBC02D), Color(0xFFF57C00), ((v - 23f) / 3f).coerceIn(0f, 1f))
-        v <= 28f -> androidx.compose.ui.graphics.lerp(Color(0xFFF57C00), Color(0xFFD32F2F), ((v - 26f) / 2f).coerceIn(0f, 1f))
-        else -> Color(0xFF8B0000)
-    }
+    return gradientPeAncore(v, ancoreTemperatura)
 }
+
+// Umiditatea, in stilul barei meteo (maro uscat -> verde -> turcoaz -> albastru inchis),
+// centrata pe intervalul ideal dintr-un apartament (40-60% = verde).
+private val ancoreUmiditate = listOf(
+    30f to Color(0xFFB1764E),   // maro (aer foarte uscat)
+    40f to Color(0xFF7CB342),   // verde deschis (acceptabil spre uscat)
+    50f to Color(0xFF43A047),   // verde (ideal 40-60%)
+    60f to Color(0xFF26A69A),   // turcoaz (usor umed)
+    70f to Color(0xFF1E88E5),   // albastru (umed)
+    80f to Color(0xFF0D47A1)    // albastru inchis (excesiv)
+)
 
 fun getHumidColor(v: Float): Color {
     if (v == -999f) return Color.Transparent
-    return when {
-        v <= 0f -> Color(0xFF8D6E63)
-        v <= 30f -> androidx.compose.ui.graphics.lerp(Color(0xFF8D6E63), Color(0xFF689F38), (v / 30f).coerceIn(0f, 1f))
-        v <= 50f -> androidx.compose.ui.graphics.lerp(Color(0xFF689F38), Color(0xFF4CAF50), ((v - 30f) / 20f).coerceIn(0f, 1f))
-        v <= 80f -> androidx.compose.ui.graphics.lerp(Color(0xFF4CAF50), Color(0xFF00796B), ((v - 50f) / 30f).coerceIn(0f, 1f))
-        v <= 90f -> androidx.compose.ui.graphics.lerp(Color(0xFF00796B), Color(0xFF1976D2), ((v - 80f) / 10f).coerceIn(0f, 1f))
-        v <= 100f -> androidx.compose.ui.graphics.lerp(Color(0xFF1976D2), Color(0xFF0D47A1), ((v - 90f) / 10f).coerceIn(0f, 1f))
-        else -> Color(0xFF0D47A1)
-    }
+    return gradientPeAncore(v, ancoreUmiditate)
 }
 
 fun ascultaFirebase(db: DatabaseReference, child: String, type: Class<out Any>, onChange: (Any?) -> Unit): ValueEventListener {
@@ -270,236 +309,299 @@ fun SliderInteligentCustom(
 }
 
 // ================= WIDGET PROVIDER =================
-class SmartPurifierWidget : AppWidgetProvider() {
-    override fun onUpdate(context: Context, appWidgetManager: AppWidgetManager, appWidgetIds: IntArray) {}
+// URL-ul bazei vine din secrete.properties prin BuildConfig (nimic privat hardcodat in sursa)
+private const val WIDGET_DB_URL = BuildConfig.DB_URL
+
+/**
+ * Deseneaza un cadran rotund (arc de 260°) in stil Samsung One UI:
+ * track subtil gri, arc colorat cu capete rotunjite, eticheta (alba) in centrul inelului
+ * si valoarea mare (alba, bold) sub arc. value<0 / valString="--" = stare fara date.
+ */
+private fun creeazaCadranWidget(value: Float, max: Float, label: String, valString: String, colorInt: Int, etichetaVechime: String? = null, subscript: String? = null): android.graphics.Bitmap {
+    val size = 320
+    val bitmap = androidx.core.graphics.createBitmap(size, size, android.graphics.Bitmap.Config.ARGB_8888)
+    val canvas = android.graphics.Canvas(bitmap)
+    val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+    // Arc CIRCULAR (rect PATRAT!) in zona superioara; valoarea mare dedesubt — stil One UI.
+    // (versiunea veche folosea un rect dreptunghiular -> arc turtit/eliptic, de-aia arata prost)
+    val cx = size / 2f
+    val arcCy = 152f
+    val arcR = 130f     // inel mare, ca pe cadranele native One UI
+    val strokeW = 40f   // grosimea inelului nativ One UI
+    // Arc de 240° cu golul de 120° centrat jos (start 150°): mai scurt, ca sa nu se
+    // atinga capetele de valoarea mare desenata dedesubt.
+    val arcStart = 151.5f
+    val arcSweep = 238f
+    val rect = android.graphics.RectF(cx - arcR, arcCy - arcR, cx + arcR, arcCy + arcR)
+
+    // Track subtil (inelul de fundal) — gri deschis, ca pe cadranele native One UI
+    paint.style = android.graphics.Paint.Style.STROKE
+    paint.strokeWidth = strokeW
+    paint.strokeCap = android.graphics.Paint.Cap.ROUND
+    paint.color = 0xFF45484D.toInt()
+    canvas.drawArc(rect, arcStart, arcSweep, false, paint)
+
+    // Arc colorat (progresul)
+    paint.color = colorInt
+    val sweep = (value / max).coerceIn(0f, 1f) * arcSweep
+    if (sweep > 0f) canvas.drawArc(rect, arcStart, sweep, false, paint)
+
+    // Eticheta (PM / CO2) in centrul inelului, cu subscript optional (PM₂.₅ / CO₂, stil One UI).
+    // Alba, ca valoarea — mai vizibila si identica cu widgeturile native One UI.
+    paint.style = android.graphics.Paint.Style.FILL
+    paint.color = android.graphics.Color.WHITE
+    paint.typeface = android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.BOLD)
+    paint.textSize = 72f
+    val labelBaseline = arcCy - ((paint.descent() + paint.ascent()) / 2f) -9f
+    if (subscript == null) {
+        paint.textAlign = android.graphics.Paint.Align.CENTER
+        canvas.drawText(label, cx, labelBaseline, paint)
+    } else {
+        // centram ansamblul "label + subscript" si desenam subscriptul mai mic, coborat
+        paint.textAlign = android.graphics.Paint.Align.LEFT
+        val latimeLabel = paint.measureText(label)
+        paint.textSize = 44f
+        val latimeSub = paint.measureText(subscript)
+        paint.textSize = 72f
+        val startX = cx - (latimeLabel + latimeSub) / 2f
+        canvas.drawText(label, startX, labelBaseline, paint)
+        paint.textSize = 44f
+        canvas.drawText(subscript, startX + latimeLabel, labelBaseline + 20f, paint)
+        paint.textAlign = android.graphics.Paint.Align.CENTER
+    }
+
+    // Indicator de vechime: cand cache-ul e vechi, varsta datelor apare in inel, sub eticheta
+    if (etichetaVechime != null) {
+        paint.color = 0xFF8E8E93.toInt()
+        paint.textSize = 28f
+        paint.typeface = android.graphics.Typeface.create("sans-serif", android.graphics.Typeface.NORMAL)
+        canvas.drawText(etichetaVechime, cx, arcCy + 52f, paint)
+    }
+
+    // Valoarea mare, sub arc
+    paint.color = android.graphics.Color.WHITE
+    paint.typeface = android.graphics.Typeface.create("sans-serif", android.graphics.Typeface.BOLD)
+    paint.textSize = 82f
+    canvas.drawText(valString, cx, size - 19.5f, paint)
+
+    return bitmap
 }
 
-// ================= SERVICIUL DE FUNDAL =================
-class SmartPurifierService : Service() {
-    private val dbRoot = FirebaseDatabase.getInstance("https://YOUR_PROJECT-default-rtdb.firebasedatabase.app/").getReference("SenzoriAer")
-    private var timpUltimaNotifPraf = 0L
-    private var timpUltimaNotifGaze = 0L
-    private var eraOffline = false
-    private var initLoadDone = false
-    private val activeListeners = mutableListOf<Pair<DatabaseReference, ValueEventListener>>()
-    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+/** Construieste RemoteViews-ul si actualizeaza toate instantele widgetului. pm25<0 / co2<0 = fara date (--). */
+private fun randeazaWidget(context: Context, pm25: Float, co2: Int, varstaMinute: Long = 0L) {
+    val mgr = AppWidgetManager.getInstance(context)
+    val component = ComponentName(context, SmartPurifierWidget::class.java)
+    if (mgr.getAppWidgetIds(component).isEmpty()) return
 
-    override fun onBind(intent: Intent?): IBinder? = null
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+    val views = RemoteViews(context.packageName, R.layout.widget_purificator)
+    val intent = Intent(context, MainActivity::class.java).apply { flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK }
+    val pendingIntent = android.app.PendingIntent.getActivity(context, 0, intent, android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE)
 
-    private fun ataseazaListener(ref: DatabaseReference, listener: ValueEventListener) {
-        ref.addValueEventListener(listener)
-        activeListeners.add(ref to listener)
+    // Date mai vechi de ~20 min (workerul ruleaza la 15) = probabil intrerupte: cadranele
+    // devin gri si afiseaza varsta, ca sa nu para masuratori live valori de acum cateva ore.
+    val esteVechi = varstaMinute >= 20
+    val etichetaVechime = when {
+        !esteVechi -> null
+        varstaMinute < 60 -> "acum ${varstaMinute}m"
+        varstaMinute < 1440 -> "acum ${varstaMinute / 60}h"
+        else -> "acum ${varstaMinute / 1440}z"
     }
 
-    override fun onCreate() {
-        super.onCreate()
-        val canalServiciu = NotificationChannel("SERVICIU_FUNDAL", "Rulare in fundal", NotificationManager.IMPORTANCE_MIN)
-        getSystemService(NotificationManager::class.java).createNotificationChannel(canalServiciu)
+    val grayNoData = 0xFF6E6E73.toInt()
+    val arePm = pm25 >= 0f
+    val areCo2 = co2 >= 0
+    val pmColor  = if (!arePm || esteVechi)  grayNoData else when { pm25 < 5 -> 0xFF00E174.toInt(); pm25 < 12 -> 0xFFFFEB3B.toInt(); pm25 < 35 -> 0xFFFF9800.toInt(); else -> 0xFFF44336.toInt() }
+    val co2Color = if (!areCo2 || esteVechi) grayNoData else when { co2 < 800 -> 0xFF00E174.toInt(); co2 < 1200 -> 0xFFFFEB3B.toInt(); co2 < 1600 -> 0xFFFF9800.toInt(); else -> 0xFFF44336.toInt() }
 
-        val intentAplicatie = Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+    // Sub 10 µg/m³ zecimala conteaza (5 vs 9 e o diferenta mare de calitate) — o afisam;
+    // peste 10, valoarea intreaga e suficienta si tine cadranul aerisit.
+    val pmText = if (!arePm) "--" else if (pm25 < 10f) "%.1f".format(pm25) else "%.0f".format(pm25)
+    val pmBitmap  = creeazaCadranWidget(if (arePm) pm25 else 0f, 35f, "PM", pmText, pmColor, etichetaVechime, subscript = "2.5")
+    val co2Bitmap = creeazaCadranWidget(if (areCo2) (co2 - 400f).coerceAtLeast(0f) else 0f, 1600f, "CO", if (areCo2) co2.toString() else "--", co2Color, etichetaVechime, subscript = "2")
+    views.setImageViewBitmap(R.id.iv_widget_pm, pmBitmap)
+    views.setImageViewBitmap(R.id.iv_widget_co2, co2Bitmap)
+    views.setOnClickPendingIntent(R.id.iv_widget_pm, pendingIntent)
+    views.setOnClickPendingIntent(R.id.iv_widget_co2, pendingIntent)
+    mgr.updateAppWidget(component, views)
+}
+
+/** Salveaza ultimele valori in cache si redeseneaza widgetul (apelat cand sosesc date noi). */
+private fun actualizeazaWidget(context: Context, pm25: Float, co2: Int) {
+    context.getSharedPreferences("AppPrefs", Context.MODE_PRIVATE).edit {
+        putFloat("widgetPm25", pm25); putInt("widgetCo2", co2); putLong("widgetTs", System.currentTimeMillis())
+    }
+    randeazaWidget(context, pm25, co2)
+}
+
+/** Redeseneaza widgetul din ultimele valori salvate in cache (instant, fara retea). */
+private fun randeazaWidgetDinCache(context: Context) {
+    val prefs = context.getSharedPreferences("AppPrefs", Context.MODE_PRIVATE)
+    val ts = prefs.getLong("widgetTs", 0L)
+    if (ts <= 0L) { randeazaWidget(context, -1f, -1); return }
+    val varstaMinute = ((System.currentTimeMillis() - ts) / 60000L).coerceAtLeast(0L)
+    randeazaWidget(context, prefs.getFloat("widgetPm25", -1f), prefs.getInt("widgetCo2", -1), varstaMinute)
+}
+
+/** Best-effort: daca exista o sesiune Firebase activa, cere valori proaspete si actualizeaza widgetul. */
+private fun cerereProaspataFirebase(context: Context) {
+    try {
+        if (FirebaseAuth.getInstance().currentUser == null) return
+        val db = FirebaseDatabase.getInstance(WIDGET_DB_URL).getReference("SenzoriAer")
+        db.child("last_update").get().addOnSuccessListener { upSnap ->
+            // Daca purificatorul nu mai trimite date, valorile din DB sunt vechi — nu le
+            // stampilam ca proaspete; lasam cache-ul si indicatorul de vechime sa vorbeasca.
+            val lastUpdate = (upSnap.value as? Number)?.toLong() ?: return@addOnSuccessListener
+            if ((System.currentTimeMillis() - lastUpdate) / 1000 >= 90) { randeazaWidgetDinCache(context); return@addOnSuccessListener }
+            db.child("PM25").get().addOnSuccessListener { pmSnap ->
+                db.child("CO2").get().addOnSuccessListener { co2Snap ->
+                    val pm = (pmSnap.value as? Number)?.toFloat()
+                    val co2 = (co2Snap.value as? Number)?.toInt()
+                    if (pm != null && co2 != null) actualizeazaWidget(context, pm, co2)
+                }
+            }
         }
-        val pendingIntentAplicatie = android.app.PendingIntent.getActivity(
-            this, 0, intentAplicatie,
-            android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
-        )
-        val notificarePermanenta = NotificationCompat.Builder(this, "SERVICIU_FUNDAL")
-            .setContentTitle("Smart Purifier Activ")
-            .setContentText("Aparatul iti monitorizeaza aerul in fundal.")
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setContentIntent(pendingIntentAplicatie)
+    } catch (_: Exception) {}
+}
+
+class SmartPurifierWidget : AppWidgetProvider() {
+    override fun onUpdate(context: Context, appWidgetManager: AppWidgetManager, appWidgetIds: IntArray) {
+        // Randam instant din cache (functioneaza si fara serviciu / fara retea, ex: dupa reboot),
+        // apoi incercam best-effort o valoare proaspata din Firebase daca avem sesiune.
+        randeazaWidgetDinCache(context)
+        cerereProaspataFirebase(context)
+    }
+}
+
+// ================= ALERTE PUSH (FCM) + VERIFICARE OFFLINE (WorkManager) =================
+// Vechiul Foreground Service (dataSync) a fost eliminat: pe Android 15+ acest tip de
+// serviciu este oprit fortat dupa ~6h/zi, deci monitorizarea 24/7 murea oricum.
+// Noua arhitectura, cu consum de baterie aproape zero pe telefon:
+//   - alertele de poluare sosesc ca notificari push FCM trimise DIRECT de ESP32
+//     (ajung si cu aplicatia inchisa — sistemul trezeste aplicatia la primire);
+//   - un worker periodic (WorkManager, ~15 min) verifica daca purificatorul mai
+//     trimite date (alerta de offline) si improspateaza widgetul; ruleaza doar cu
+//     internet si supravietuieste restartului telefonului (spre deosebire de FGS).
+
+fun asiguraCanalAlerte(context: Context) {
+    val canal = NotificationChannel("ALERTE_AER", "Alerte Calitate Aer", NotificationManager.IMPORTANCE_HIGH)
+    context.getSystemService(NotificationManager::class.java).createNotificationChannel(canal)
+}
+
+fun arataNotificare(context: Context, titlu: String, mesaj: String) {
+    if (ActivityCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return
+    asiguraCanalAlerte(context)
+    val intentAplicatie = Intent(context, MainActivity::class.java).apply {
+        flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+    }
+    val pendingIntentAplicatie = android.app.PendingIntent.getActivity(
+        context, System.currentTimeMillis().toInt(), intentAplicatie,
+        android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+    )
+    val builder = NotificationCompat.Builder(context, "ALERTE_AER")
+        .setSmallIcon(android.R.drawable.ic_dialog_alert)
+        .setContentTitle(titlu).setContentText(mesaj)
+        .setPriority(NotificationCompat.PRIORITY_HIGH)
+        .setAutoCancel(true).setContentIntent(pendingIntentAplicatie)
+    NotificationManagerCompat.from(context).notify(System.currentTimeMillis().toInt(), builder.build())
+}
+
+/** Aboneaza/dezaboneaza telefonul la alertele push si porneste/opreste verificarea periodica. */
+fun configureazaAlerteFundal(context: Context, activ: Boolean) {
+    val workManager = WorkManager.getInstance(context)
+    if (activ) {
+        FirebaseMessaging.getInstance().subscribeToTopic("alerte_aer")
+        val cerere = PeriodicWorkRequestBuilder<VerificareOfflineWorker>(15, TimeUnit.MINUTES)
+            .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
             .build()
+        workManager.enqueueUniquePeriodicWork("verificare_offline", ExistingPeriodicWorkPolicy.UPDATE, cerere)
+    } else {
+        FirebaseMessaging.getInstance().unsubscribeFromTopic("alerte_aer")
+        workManager.cancelUniqueWork("verificare_offline")
+    }
+}
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(1, notificarePermanenta, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
-        } else {
-            startForeground(1, notificarePermanenta)
-        }
-
-        var notifPraf = true; var notifGaze = true; var notifOffline = true
-        var lastUpdate = System.currentTimeMillis()
-        var curentPm25 = 0f; var curentCo2 = 0
-        var curentVoc = 0f; var curentNox = 0f
-        var nightModeStatus = false
-        val prefs = getSharedPreferences("AppPrefs", MODE_PRIVATE)
-
-        ataseazaListener(dbRoot.child("app/notif_praf"), object : ValueEventListener {
-            override fun onDataChange(s: DataSnapshot) { notifPraf = s.getValue(Boolean::class.java) ?: true }
-            override fun onCancelled(error: DatabaseError) {}
-        })
-        ataseazaListener(dbRoot.child("app/notif_gaze"), object : ValueEventListener {
-            override fun onDataChange(s: DataSnapshot) { notifGaze = s.getValue(Boolean::class.java) ?: true }
-            override fun onCancelled(error: DatabaseError) {}
-        })
-        ataseazaListener(dbRoot.child("app/notif_offline"), object : ValueEventListener {
-            override fun onDataChange(s: DataSnapshot) { notifOffline = s.getValue(Boolean::class.java) ?: true }
-            override fun onCancelled(error: DatabaseError) {}
-        })
-        ataseazaListener(dbRoot.child("setari/night_mode"), object : ValueEventListener {
-            override fun onDataChange(s: DataSnapshot) { nightModeStatus = s.getValue(Boolean::class.java) ?: false }
-            override fun onCancelled(error: DatabaseError) {}
-        })
-        ataseazaListener(dbRoot.child("last_update"), object : ValueEventListener {
-            override fun onDataChange(s: DataSnapshot) {
-                lastUpdate = s.getValue(Long::class.java) ?: System.currentTimeMillis()
-                initLoadDone = true
-                if (eraOffline) eraOffline = false
-            }
-            override fun onCancelled(error: DatabaseError) {}
-        })
-
-        fun checkGazAlert() {
-            if (!notifGaze || !initLoadDone) return
-            val alertCo2 = prefs.getFloat("alertCo2", 1500f).toInt()
-            val alertVoc = prefs.getFloat("alertVoc", 250f)
-            val alertNox = prefs.getFloat("alertNox", 150f)
-            val notifFreq = prefs.getInt("notifFreqMins", 10) * 60000L
-            if (System.currentTimeMillis() - timpUltimaNotifGaze <= notifFreq) return
-            val motiv = when {
-                curentCo2 >= alertCo2 -> "CO2 a ajuns la $curentCo2 ppm!"
-                curentVoc >= alertVoc -> "VOC a ajuns la nivelul ${curentVoc.toInt()}!"
-                curentNox >= alertNox -> "NOx a ajuns la nivelul ${curentNox.toInt()}!"
-                else -> return
-            }
-            trimiteAlarma("⚠️ Alertă Aerisire", motiv)
-            timpUltimaNotifGaze = System.currentTimeMillis()
-        }
-
-        ataseazaListener(dbRoot.child("PM25"), object : ValueEventListener {
-            override fun onDataChange(s: DataSnapshot) {
-                curentPm25 = s.getValue(Double::class.java)?.toFloat() ?: 0f
-                updateWidget(this@SmartPurifierService, curentPm25, curentCo2)
-                val alertPm = prefs.getFloat("alertPm", 35f)
-                val notifFreq = prefs.getInt("notifFreqMins", 10) * 60000L
-                if (notifPraf && curentPm25 >= alertPm && (System.currentTimeMillis() - timpUltimaNotifPraf > notifFreq) && initLoadDone) {
-                    trimiteAlarma("⚠️ Alerta Praf", "Nivel ridicat de PM2.5: %.1f µg/m³!".format(curentPm25))
-                    timpUltimaNotifPraf = System.currentTimeMillis()
-                }
-            }
-            override fun onCancelled(error: DatabaseError) {}
-        })
-        ataseazaListener(dbRoot.child("CO2"), object : ValueEventListener {
-            override fun onDataChange(s: DataSnapshot) {
-                curentCo2 = s.getValue(Int::class.java) ?: 0
-                updateWidget(this@SmartPurifierService, curentPm25, curentCo2)
-                checkGazAlert()
-            }
-            override fun onCancelled(error: DatabaseError) {}
-        })
-        ataseazaListener(dbRoot.child("VOC"), object : ValueEventListener {
-            override fun onDataChange(s: DataSnapshot) {
-                curentVoc = (s.getValue(Double::class.java)?.toFloat() ?: 0f).let { if (it > 1000f) 0f else it }
-                checkGazAlert()
-            }
-            override fun onCancelled(error: DatabaseError) {}
-        })
-        ataseazaListener(dbRoot.child("NOx"), object : ValueEventListener {
-            override fun onDataChange(s: DataSnapshot) {
-                curentNox = (s.getValue(Double::class.java)?.toFloat() ?: 0f).let { if (it > 1000f) 0f else it }
-                checkGazAlert()
-            }
-            override fun onCancelled(error: DatabaseError) {}
-        })
-
-        serviceScope.launch {
-            var lastScheduleCheck = 0L
-            while (isActive) {
-                val currentTime = System.currentTimeMillis()
-                if (initLoadDone) {
-                    val dif = (currentTime - lastUpdate) / 1000
-                    if (dif >= 60 && !eraOffline && notifOffline) {
-                        trimiteAlarma("⚠️ Dispozitiv Offline", "Purificatorul a pierdut conexiunea WiFi!")
-                        eraOffline = true
-                    }
-                }
-                if (currentTime - lastScheduleCheck > 60000) {
-                    lastScheduleCheck = currentTime
-                    val nightModeAuto = prefs.getBoolean("nightModeAuto", false)
-                    if (nightModeAuto) {
-                        val startHr = prefs.getInt("nmStartHr", 23); val startMin = prefs.getInt("nmStartMin", 0)
-                        val endHr = prefs.getInt("nmEndHr", 7); val endMin = prefs.getInt("nmEndMin", 0)
-                        val localTime = LocalTime.now()
-                        val currentMinutes = localTime.hour * 60 + localTime.minute
-                        val startMinutes = startHr * 60 + startMin; val endMinutes = endHr * 60 + endMin
-                        val shouldBeOn = if (startMinutes <= endMinutes) currentMinutes in startMinutes until endMinutes
-                        else currentMinutes !in endMinutes until startMinutes
-                        if (shouldBeOn && !nightModeStatus) dbRoot.child("setari/night_mode").setValue(true)
-                        else if (!shouldBeOn && nightModeStatus) dbRoot.child("setari/night_mode").setValue(false)
-                    }
-                }
-                delay(2000)
-            }
-        }
+class AlerteFcmService : FirebaseMessagingService() {
+    override fun onMessageReceived(mesaj: RemoteMessage) {
+        // Improspatam widgetul din payload-ul de date atasat alertei de catre ESP32
+        val pm = mesaj.data["pm25"]?.toFloatOrNull()
+        val co2 = mesaj.data["co2"]?.toIntOrNull()
+        if (pm != null && co2 != null) actualizeazaWidget(this, pm, co2)
+        // In fundal, mesajele de tip "notification" sunt afisate automat de sistem;
+        // cand aplicatia e in prim-plan ele ajung aici si trebuie afisate manual.
+        mesaj.notification?.let { n -> arataNotificare(this, n.title ?: "Smart Air", n.body ?: "") }
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        serviceScope.cancel()
-        activeListeners.forEach { (ref, listener) -> ref.removeEventListener(listener) }
-        activeListeners.clear()
+    override fun onNewToken(token: String) {
+        // Folosim topicuri (nu tokenuri individuale) — abonamentul se reface automat la token nou.
+    }
+}
+
+/** Asteapta un Task Play Services intr-o corutina, cu propagarea erorii. */
+private suspend fun <T> com.google.android.gms.tasks.Task<T>.asteapta(): T =
+    suspendCancellableCoroutine { cont ->
+        addOnSuccessListener { cont.resume(it) }
+        addOnFailureListener { cont.resumeWithException(it) }
     }
 
-    private fun updateWidget(context: Context, pm25: Float, co2: Int) {
-        val appWidgetManager = AppWidgetManager.getInstance(context)
-        val componentName = ComponentName(context, SmartPurifierWidget::class.java)
-        val remoteViews = RemoteViews(context.packageName, R.layout.widget_purificator)
-        val intent = Intent(context, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
-        }
-        val pendingIntent = android.app.PendingIntent.getActivity(
-            context, 0, intent,
-            android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
-        )
-        val pmColorInt = when { pm25 < 12 -> 0xFF00E676.toInt(); pm25 < 35 -> 0xFFFFEB3B.toInt(); pm25 < 55 -> 0xFFFF9800.toInt(); else -> 0xFFF44336.toInt() }
-        val coColorInt = when { co2 < 800 -> 0xFF00E676.toInt(); co2 < 1000 -> 0xFFFFEB3B.toInt(); co2 < 1500 -> 0xFFFF9800.toInt(); else -> 0xFFF44336.toInt() }
-        val pmBitmap = createWidgetDial(value = pm25, max = 55f, label = "PM", valString = "%.0f".format(pm25), colorInt = pmColorInt)
-        val co2Bitmap = createWidgetDial(value = (co2 - 400f).coerceAtLeast(0f), max = 1100f, label = "CO2", valString = co2.toString(), colorInt = coColorInt)
-        remoteViews.setImageViewBitmap(R.id.iv_widget_pm, pmBitmap)
-        remoteViews.setImageViewBitmap(R.id.iv_widget_co2, co2Bitmap)
-        remoteViews.setOnClickPendingIntent(R.id.iv_widget_pm, pendingIntent)
-        remoteViews.setOnClickPendingIntent(R.id.iv_widget_co2, pendingIntent)
-        appWidgetManager.updateAppWidget(componentName, remoteViews)
+/**
+ * Citire FRESH din RTDB prin REST (`https://.../cale.json?auth=token`). Ocolește COMPLET
+ * cache-ul de persistență al SDK-ului — cauza reală a alertelor false de offline: `get()`-ul
+ * SDK putea întoarce un `last_update` vechi din cache (re-sincronizarea după reconectare nu se
+ * termină garantat înainte ca get() să se rezolve). REST întoarce mereu valoarea curentă de pe
+ * server. Returnează corpul răspunsului ca text (ex. "1718900000000"), sau null la orice eroare.
+ */
+private fun rtdbRestGet(cale: String, token: String): String? {
+    val url = URL("${WIDGET_DB_URL.trimEnd('/')}/$cale.json?auth=${URLEncoder.encode(token, "UTF-8")}")
+    val conn = (url.openConnection() as HttpURLConnection).apply {
+        requestMethod = "GET"; connectTimeout = 8000; readTimeout = 8000
     }
+    return try {
+        if (conn.responseCode == 200) conn.inputStream.bufferedReader().use { it.readText() }.trim() else null
+    } catch (_: Exception) { null } finally { conn.disconnect() }
+}
 
-    private fun createWidgetDial(value: Float, max: Float, label: String, valString: String, colorInt: Int): android.graphics.Bitmap {
-        val size = 300
-        val bitmap = androidx.core.graphics.createBitmap(size, size, android.graphics.Bitmap.Config.ARGB_8888)
-        val canvas = android.graphics.Canvas(bitmap)
-        val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
-        val strokeW = 34f
-        val rect = android.graphics.RectF(strokeW, strokeW, size - strokeW, size - strokeW - 45f)
-        paint.style = android.graphics.Paint.Style.STROKE; paint.strokeWidth = strokeW
-        paint.strokeCap = android.graphics.Paint.Cap.ROUND; paint.color = 0xFF333333.toInt()
-        canvas.drawArc(rect, 135f, 270f, false, paint)
-        paint.color = colorInt
-        val sweepAngle = (value / max).coerceIn(0f, 1f) * 270f
-        if (sweepAngle > 0) canvas.drawArc(rect, 135f, sweepAngle, false, paint)
-        paint.style = android.graphics.Paint.Style.FILL; paint.color = android.graphics.Color.WHITE
-        paint.textSize = 55f; paint.textAlign = android.graphics.Paint.Align.CENTER
-        paint.typeface = android.graphics.Typeface.create(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD)
-        canvas.drawText(label, rect.centerX(), rect.centerY() - ((paint.descent() + paint.ascent()) / 2), paint)
-        paint.textSize = 65f
-        canvas.drawText(valString, rect.centerX(), size.toFloat() - 5f, paint)
-        return bitmap
-    }
+class VerificareOfflineWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
+    override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
+        val ctx = applicationContext
+        val prefs = ctx.getSharedPreferences("AppPrefs", Context.MODE_PRIVATE)
+        try {
+            val user = FirebaseAuth.getInstance().currentUser
+            if (user == null) { randeazaWidgetDinCache(ctx); return@withContext Result.success() }
 
-    private fun trimiteAlarma(titlu: String, mesaj: String) {
-        val intentAplicatie = Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+            // Token de autentificare (cache-uit, se reînnoiește singur dacă a expirat).
+            val token = withTimeout(10000) { user.getIdToken(false).asteapta().token }
+            if (token == null) { randeazaWidgetDinCache(ctx); return@withContext Result.success() }
+
+            // Citiri FRESH prin REST — niciun cache SDK implicat. Dacă nu avem rețea/răspuns,
+            // last_update e null → NU dăm niciun verdict (nu acuzăm placa pentru rețeaua noastră).
+            val lastUpdate = rtdbRestGet("SenzoriAer/last_update", token)?.toLongOrNull()
+            if (lastUpdate == null) { randeazaWidgetDinCache(ctx); return@withContext Result.success() }
+            val pm = rtdbRestGet("SenzoriAer/PM25", token)?.toFloatOrNull()
+            val co2 = rtdbRestGet("SenzoriAer/CO2", token)?.toIntOrNull()
+
+            val secundeVechi = (System.currentTimeMillis() - lastUpdate) / 1000
+            val prevLastUpdate = prefs.getLong("workerLastUpdate", 0L)
+            val aAvansat = lastUpdate > prevLastUpdate   // placa a scris de la ultima verificare → e VIE
+
+            // Offline DOAR dacă timestamp-ul e ȘI vechi (>90 s), ȘI nu a avansat față de verificarea
+            // precedentă. A doua condiție elimină orice fals-pozitiv: o citire care a avansat = sigur
+            // online (indiferent de ceasul telefonului); doar un timestamp efectiv ÎNGHEȚAT între două
+            // verificări (la 15 min) declanșează alerta. Pe prima rulare (prev=0) nu alertăm.
+            val esteOffline = secundeVechi >= 90 && !aAvansat && prevLastUpdate > 0L
+            val eraOffline = prefs.getBoolean("workerEraOffline", false)
+
+            if (esteOffline && !eraOffline && prefs.getBoolean("notifOffline", true)) {
+                val deCat = if (secundeVechi < 3600) "${secundeVechi / 60} minute" else "${secundeVechi / 3600} ore"
+                arataNotificare(ctx, "⚠️ Dispozitiv Offline", "Purificatorul nu a mai trimis date de $deCat!")
+            }
+            prefs.edit { putLong("workerLastUpdate", lastUpdate); putBoolean("workerEraOffline", esteOffline) }
+
+            if (!esteOffline && pm != null && co2 != null) actualizeazaWidget(ctx, pm, co2)
+            else randeazaWidgetDinCache(ctx)
+        } catch (_: Exception) {
+            randeazaWidgetDinCache(ctx)
         }
-        val pendingIntentAplicatie = android.app.PendingIntent.getActivity(
-            this, System.currentTimeMillis().toInt(), intentAplicatie,
-            android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
-        )
-        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) {
-            val builder = NotificationCompat.Builder(this, "ALERTE_AER")
-                .setSmallIcon(android.R.drawable.ic_dialog_alert)
-                .setContentTitle(titlu).setContentText(mesaj)
-                .setPriority(NotificationCompat.PRIORITY_HIGH)
-                .setAutoCancel(true).setContentIntent(pendingIntentAplicatie)
-            NotificationManagerCompat.from(this).notify(System.currentTimeMillis().toInt(), builder.build())
-        }
+        Result.success()
     }
 }
 
@@ -507,11 +609,27 @@ class SmartPurifierService : Service() {
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Garda de configuratie: fara secrete.properties completat, afisam instructiuni
+        // clare in loc sa crapam cu un URL gol la prima initializare Firebase.
+        if (BuildConfig.DB_URL.isEmpty() || BuildConfig.FB_EMAIL.isEmpty() || BuildConfig.FB_PASS.isEmpty()) {
+            setContent {
+                MaterialTheme {
+                    Box(modifier = Modifier.fillMaxSize().background(Color.White), contentAlignment = Alignment.Center) {
+                        Text(
+                            "Configurație lipsă!\n\nCopiază secrete.properties.example ca secrete.properties, completează smartair.dbUrl / smartair.fbEmail / smartair.fbPass și refă build-ul.",
+                            color = Color.Red, textAlign = TextAlign.Center, fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(24.dp)
+                        )
+                    }
+                }
+            }
+            return
+        }
         try { FirebaseDatabase.getInstance().setPersistenceEnabled(true) } catch (_: Exception) {}
         val auth = FirebaseAuth.getInstance()
-        if (auth.currentUser?.email != "YOUR_APP_EMAIL") {
+        if (auth.currentUser?.email != BuildConfig.FB_EMAIL) {
             auth.signOut()
-            auth.signInWithEmailAndPassword("YOUR_APP_EMAIL", "YOUR_PASSWORD")
+            auth.signInWithEmailAndPassword(BuildConfig.FB_EMAIL, BuildConfig.FB_PASS)
                 .addOnCompleteListener { task ->
                     if (task.isSuccessful) {
                         pornireAplicatie()
@@ -522,7 +640,7 @@ class MainActivity : ComponentActivity() {
                             MaterialTheme {
                                 Box(modifier = Modifier.fillMaxSize().background(Color.White), contentAlignment = Alignment.Center) {
                                     Text(
-                                        "Eroare Firebase:\n\n$mesajEroare\n\nVerifică adresa de email și parola în consola Firebase!",
+                                        "Eroare Firebase:\n\n$mesajEroare\n\nVerifică datele din secrete.properties și contul din consola Firebase!",
                                         color = Color.Red, textAlign = TextAlign.Center, fontWeight = FontWeight.Bold,
                                         modifier = Modifier.padding(24.dp)
                                     )
@@ -537,17 +655,16 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun pornireAplicatie() {
-        val channel = NotificationChannel("ALERTE_AER", "Alerte Calitate Aer", NotificationManager.IMPORTANCE_HIGH)
-        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        asiguraCanalAlerte(this)
+        // canalul vechiului serviciu permanent nu mai e folosit — il scoatem din setarile sistemului
+        getSystemService(NotificationManager::class.java).deleteNotificationChannel("SERVICIU_FUNDAL")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ActivityCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
                 ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
             }
         }
         val prefs = getSharedPreferences("AppPrefs", MODE_PRIVATE)
-        if (prefs.getBoolean("runInBackground", true)) {
-            startForegroundService(Intent(this, SmartPurifierService::class.java))
-        }
+        configureazaAlerteFundal(this, prefs.getBoolean("runInBackground", true))
         setContent { MaterialTheme { PurificatorAppMain() } }
     }
 }
@@ -556,40 +673,15 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun PurificatorAppMain() {
     val context = LocalContext.current
-    val database = FirebaseDatabase.getInstance("https://YOUR_PROJECT-default-rtdb.firebasedatabase.app/").getReference("SenzoriAer")
+    val database = FirebaseDatabase.getInstance(WIDGET_DB_URL).getReference("SenzoriAer")
     val prefs = context.getSharedPreferences("AppPrefs", Context.MODE_PRIVATE)
 
     val coroutineScope = rememberCoroutineScope()
     val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
     val liveModeJob = remember { mutableStateOf<Job?>(null) }
 
-    DisposableEffect(lifecycleOwner) {
-        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
-            when (event) {
-                androidx.lifecycle.Lifecycle.Event.ON_START,
-                androidx.lifecycle.Lifecycle.Event.ON_RESUME -> {
-                    liveModeJob.value?.cancel(); liveModeJob.value = null
-                    database.child("setari/live_mode").setValue(true)
-                }
-                androidx.lifecycle.Lifecycle.Event.ON_STOP,
-                androidx.lifecycle.Lifecycle.Event.ON_PAUSE -> {
-                    if (!prefs.getBoolean("liveModePermanent", false)) {
-                        liveModeJob.value?.cancel()
-                        liveModeJob.value = coroutineScope.launch {
-                            delay(10000)
-                            database.child("setari/live_mode").setValue(false)
-                        }
-                    }
-                }
-                else -> {}
-            }
-        }
-        lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
-    }
-
     var isDarkMode by remember { mutableStateOf(prefs.getBoolean("isDarkMode", true)) }
-    var accentColor by remember { mutableStateOf(Color(prefs.getInt("themeColor", 0xFF007AFF.toInt()))) }
+    var accentColor by remember { mutableStateOf(Color(prefs.getInt("themeColor", 0xFF367AFF.toInt()))) }
     var tipGrafic by remember { mutableIntStateOf(prefs.getInt("tipGrafic", 0)) }
     var runInBackground by remember { mutableStateOf(prefs.getBoolean("runInBackground", true)) }
     var categoryOrder by remember { mutableStateOf((prefs.getString("catOrder", "0,1,2") ?: "0,1,2").split(",").mapNotNull { it.toIntOrNull() }) }
@@ -643,6 +735,42 @@ fun PurificatorAppMain() {
     var istoricTemp by remember { mutableStateOf<List<Float>>(emptyList()) }
     var istoricUmid by remember { mutableStateOf<List<Float>>(emptyList()) }
 
+    DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            when (event) {
+                androidx.lifecycle.Lifecycle.Event.ON_START,
+                androidx.lifecycle.Lifecycle.Event.ON_RESUME -> {
+                    liveModeJob.value?.cancel(); liveModeJob.value = null
+                    // Reconectare fortata la revenirea din background. IMPORTANT: operam pe ACEEASI
+                    // instanta ca listenerii (getInstance(WIDGET_DB_URL)) — pe instanta implicita,
+                    // daca URL-ul difera fie si printr-un slash, am reconecta alt obiect si ecranul
+                    // ar ramane pe date vechi pana la restart. goOnline() singur e no-op cand clientul
+                    // CREDE ca e online (socket "zombie" inghetat de Android), deci cand datele sunt
+                    // invechite rupem explicit conexiunea (goOffline) inainte sa o refacem.
+                    val db = FirebaseDatabase.getInstance(WIDGET_DB_URL)
+                    if (initLoadDone && (System.currentTimeMillis() - ultimulUpdateServer) / 1000 > 20) {
+                        db.goOffline()
+                    }
+                    db.goOnline()
+                    database.child("setari/live_mode").setValue(true)
+                }
+                androidx.lifecycle.Lifecycle.Event.ON_STOP,
+                androidx.lifecycle.Lifecycle.Event.ON_PAUSE -> {
+                    if (!prefs.getBoolean("liveModePermanent", false)) {
+                        liveModeJob.value?.cancel()
+                        liveModeJob.value = coroutineScope.launch {
+                            delay(10000)
+                            database.child("setari/live_mode").setValue(false)
+                        }
+                    }
+                }
+                else -> {}
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
     LaunchedEffect(ultimulUpdateServer, initLoadDone) {
         while (true) {
             if (initLoadDone) diferentaSecunde = (System.currentTimeMillis() - ultimulUpdateServer) / 1000
@@ -671,15 +799,21 @@ fun PurificatorAppMain() {
         asculta("setari/luminozitate_led", Int::class.java) { (it as? Int)?.let { v -> luminozitateLedServer = v } }
         asculta("setari/night_mode", Boolean::class.java) { (it as? Boolean)?.let { v -> nightModeApp = v } }
         asculta("setari/live_mode", Boolean::class.java) { (it as? Boolean)?.let { v -> liveModeServer = v } }
-        asculta("app/notif_praf", Boolean::class.java) { (it as? Boolean)?.let { v -> notifPraf = v } }
-        asculta("app/notif_gaze", Boolean::class.java) { (it as? Boolean)?.let { v -> notifGaze = v } }
-        asculta("app/notif_offline", Boolean::class.java) { (it as? Boolean)?.let { v -> notifOffline = v } }
+        // Pragurile/comutatoarele de alerte stau acum sub /setari ca sa le citeasca si ESP32
+        // (el trimite alertele push); notif_offline ramane doar pe telefon (workerul îl
+        // citeste din prefs, de aceea îl oglindim la fiecare schimbare).
+        asculta("setari/notif_praf", Boolean::class.java) { (it as? Boolean)?.let { v -> notifPraf = v } }
+        asculta("setari/notif_gaze", Boolean::class.java) { (it as? Boolean)?.let { v -> notifGaze = v } }
+        asculta("app/notif_offline", Boolean::class.java) { (it as? Boolean)?.let { v -> notifOffline = v; prefs.edit { putBoolean("notifOffline", v) } } }
         asculta("ErrorLog", String::class.java) { (it as? String)?.let { v -> errorLogServer = v } }
         asculta("PM1", Double::class.java) { (it as? Double)?.let { v -> pm1 = v.toFloat() } }
-        asculta("PM25", Double::class.java) { (it as? Double)?.let { v -> pm25 = v.toFloat() } }
+        // Widgetul se actualizeaza DOAR cand datele sunt plauzibil live (last_update recent):
+        // la pornire, persistenta Firebase livreaza intai valorile vechi din cache, iar fara
+        // gating le-am stampila ca "proaspete" si indicatorul de vechime ar minti.
+        asculta("PM25", Double::class.java) { (it as? Double)?.let { v -> pm25 = v.toFloat(); if ((System.currentTimeMillis() - ultimulUpdateServer) / 1000 < 90) actualizeazaWidget(context, pm25, co2) } }
         asculta("PM4", Double::class.java) { (it as? Double)?.let { v -> pm4 = v.toFloat() } }
         asculta("PM10", Double::class.java) { (it as? Double)?.let { v -> pm10 = v.toFloat() } }
-        asculta("CO2", Int::class.java) { (it as? Int)?.let { v -> co2 = v } }
+        asculta("CO2", Int::class.java) { (it as? Int)?.let { v -> co2 = v; if ((System.currentTimeMillis() - ultimulUpdateServer) / 1000 < 90) actualizeazaWidget(context, pm25, co2) } }
         asculta("VOC", Double::class.java) { (it as? Double)?.let { v -> voc = v.toFloat() } }
         asculta("NOx", Double::class.java) { (it as? Double)?.let { v -> nox = v.toFloat() } }
         asculta("Temperatura", Double::class.java) { (it as? Double)?.let { v -> temp = v.toFloat() } }
@@ -697,6 +831,20 @@ fun PurificatorAppMain() {
         onDispose {
             activeListeners.forEach { (child, listener) -> database.child(child).removeEventListener(listener) }
         }
+    }
+
+    // Sincronizam o data pe sesiune setarile detinute de telefon catre placa (praguri de
+    // alerta, fereastra Night Mode): ESP32 le citeste din /setari si actioneaza singur —
+    // asa primesc valori si instalarile existente, nu doar cele care re-salveaza din dialoguri.
+    LaunchedEffect(Unit) {
+        database.child("setari/alert_pm").setValue(prefs.getFloat("alertPm", 20f).toDouble())
+        database.child("setari/alert_co2").setValue(prefs.getFloat("alertCo2", 1600f).toInt())
+        database.child("setari/alert_voc").setValue(prefs.getFloat("alertVoc", 250f).toDouble())
+        database.child("setari/alert_nox").setValue(prefs.getFloat("alertNox", 30f).toDouble())
+        database.child("setari/notif_freq_min").setValue(prefs.getInt("notifFreqMins", 60))
+        database.child("setari/nm_auto").setValue(prefs.getBoolean("nightModeAuto", false))
+        database.child("setari/nm_start").setValue(prefs.getInt("nmStartHr", 23) * 60 + prefs.getInt("nmStartMin", 0))
+        database.child("setari/nm_end").setValue(prefs.getInt("nmEndHr", 8) * 60 + prefs.getInt("nmEndMin", 0))
     }
 
     Scaffold(
@@ -758,7 +906,7 @@ fun PurificatorAppMain() {
                     surfaceColor = surfaceColor, dividerColor = dividerColor, tipGrafic = tipGrafic
                 )
                 2 -> EcranSetari(
-                    context = context, prefs = prefs, nightModeActiv = nightModeApp, liveModeActiv = liveModeServer,
+                    context = context, prefs = prefs, database = database, nightModeActiv = nightModeApp, liveModeActiv = liveModeServer,
                     notifPraf = notifPraf, notifGaze = notifGaze, notifOffline = notifOffline, errorLogString = errorLogServer,
                     runInBackground = runInBackground, isDarkMode = isDarkMode, accentColor = accentColor, tipGrafic = tipGrafic,
                     textPrimary = textPrimary, textSecondary = textSecondary, surfaceColor = surfaceColor,
@@ -770,14 +918,13 @@ fun PurificatorAppMain() {
                     onLuminozitateChange = { database.child("setari/luminozitate").setValue(it) },
                     onLuminozitateLedChange = { database.child("setari/luminozitate_led").setValue(it) },
                     onLiveModeChange = { database.child("setari/live_mode").setValue(it) },
-                    onNotifPrafChange = { database.child("app/notif_praf").setValue(it) },
-                    onNotifGazeChange = { database.child("app/notif_gaze").setValue(it) },
+                    onNotifPrafChange = { database.child("setari/notif_praf").setValue(it) },
+                    onNotifGazeChange = { database.child("setari/notif_gaze").setValue(it) },
                     onNotifOfflineChange = { database.child("app/notif_offline").setValue(it) },
                     onRunInBackgroundChange = { v ->
                         runInBackground = v
                         prefs.edit(commit = true) { putBoolean("runInBackground", v) }
-                        val i = Intent(context, SmartPurifierService::class.java)
-                        if (v) context.startForegroundService(i) else context.stopService(i)
+                        configureazaAlerteFundal(context, v)
                     },
                     onThemeChange = { v -> isDarkMode = v; prefs.edit(commit = true) { putBoolean("isDarkMode", v) } },
                     onColorChange = { v -> accentColor = Color(v); prefs.edit(commit = true) { putInt("themeColor", v) } },
@@ -785,7 +932,8 @@ fun PurificatorAppMain() {
                     onCleanSensor = { database.child("setari/curatare").setValue(true) },
                     onRestartBoard = { database.child("setari/restart").setValue(true) },
                     onTempOffsetChange = { v -> database.child("setari/temp_offset").setValue((v * 10f).roundToInt() / 10.0) },
-                    onResetCalibrari = { database.child("setari/reset_calibrare").setValue(true) }
+                    onResetVoc = { database.child("setari/reset_voc").setValue(true) },
+                    onCalibrareCo2 = { database.child("setari/calibrare_co2").setValue(true) }
                 )
             }
         }
@@ -794,14 +942,16 @@ fun PurificatorAppMain() {
 
 // ================= ECRAN SCOR ZILNIC — CALCUL ÎMBUNĂTĂȚIT =================
 /**
- * Calculul scorului de calitate aer pe ultimele 24h.
+ * Scor de calitate a aerului pe ultimele 24h (0-100), reproiectat ca să reflecte expunerea REALĂ:
  *
- * Îmbunătățiri față de versiunea anterioară:
- * 1. Sub-scorurile sunt acum non-liniare (penalty exponențial la depășiri severe)
- * 2. Penalizare suplimentară dacă ORICARE poluant depășește pragul critic (override)
- * 3. Ponderi ajustate: PM2.5 rămâne cel mai important (45%), CO2 30%, VOC 15%, NOx 10%
- * 4. Bonus mic (+3 puncte) dacă toate valorile sunt sub pragul "excelent" simultan
- * 5. Dacă datele lipsesc complet pentru un poluant, sub-scorul lui e ignorat din medie
+ * 1. Sub-scor non-liniar (curbe tip EPA) per poluant, calculat la FIECARE probă de 5 min — nu pe
+ *    media zilei. Astfel vârfurile scurte de poluare contează (media valorilor le-ar ascunde).
+ * 2. La fiecare moment: scor = 50% "poluantul cel mai slab" + 50% media ponderată
+ *    (PM2.5 0.40, CO2 0.30, VOC 0.20, NOx 0.10) — un singur poluant prost trage scorul în jos.
+ * 3. Scorul zilei = 70% media tuturor probelor + 30% media celor mai proaste ~10% probe (~2.4h) —
+ *    penalizează perioadele proaste fără ca un vârf izolat să distrugă toată ziua.
+ * 4. Datele lipsă (-999) sau indecșii invalizi sunt ignorați; ponderile se renormalizează singure.
+ * 5. Fără date suficiente -> -1 (UI afișează "—").
  */
 @Composable
 fun CardScorZilnic(
@@ -813,8 +963,6 @@ fun CardScorZilnic(
     textPrimary: Color,
     textSecondary: Color
 ) {
-    data class SubScor(val valoare: Float, val areDate: Boolean)
-
     fun calcSubScorPm(avg: Float): Float {
         // EPA PM2.5 breakpoints: 0-12 excelent, 12-35 moderat, 35-55 nesănătos sensibili, 55+ nesănătos
         return when {
@@ -856,62 +1004,48 @@ fun CardScorZilnic(
         }
     }
 
+    // -1 = date insuficiente; altfel 0..100 (vezi descrierea algoritmului de mai sus).
     val scorFinal = remember(istoricPM25, istoricCO2, istoricVOC, istoricNOx) {
-        val pmValid = istoricPM25.filter { it != -999f && it >= 0f }
-        val co2Valid = istoricCO2.filter { it != -999f && it >= 0f }
-        val vocValid = istoricVOC.filter { it != -999f && it >= 0f }
-        val noxValid = istoricNOx.filter { it != -999f && it >= 0f }
+        val n = maxOf(istoricPM25.size, istoricCO2.size, istoricVOC.size, istoricNOx.size)
+        if (n == 0) return@remember -1
 
-        // Dacă nu avem absolut nicio dată, returnăm 100
-        if (pmValid.isEmpty() && co2Valid.isEmpty()) return@remember 100
+        val instScores = ArrayList<Float>(n)
+        for (i in 0 until n) {
+            var sumaW = 0f; var sumaSW = 0f; var worst = Float.MAX_VALUE
+            fun adauga(s: Float, w: Float) { sumaSW += s * w; sumaW += w; if (s < worst) worst = s }
 
-        val avgPm = if (pmValid.isNotEmpty()) pmValid.average().toFloat() else -1f
-        val avgCo2 = if (co2Valid.isNotEmpty()) co2Valid.average().toFloat() else -1f
-        val avgVoc = if (vocValid.isNotEmpty()) vocValid.average().toFloat() else -1f
-        val avgNox = if (noxValid.isNotEmpty()) noxValid.average().toFloat() else -1f
+            istoricPM25.getOrNull(i)?.let { if (it != -999f && it >= 0f) adauga(calcSubScorPm(it),  0.40f) }
+            istoricCO2.getOrNull(i)?.let  { if (it != -999f && it >= 0f) adauga(calcSubScorCo2(it), 0.30f) }
+            istoricVOC.getOrNull(i)?.let  { if (it in 1f..500f)          adauga(calcSubScorVoc(it), 0.20f) }
+            istoricNOx.getOrNull(i)?.let  { if (it in 1f..500f)          adauga(calcSubScorNox(it), 0.10f) }
 
-        // Sub-scoruri cu non-linearitate
-        val subScoruri = listOfNotNull(
-            if (avgPm >= 0f) SubScor(calcSubScorPm(avgPm), true) to 0.45f else null,
-            if (avgCo2 >= 0f) SubScor(calcSubScorCo2(avgCo2), true) to 0.30f else null,
-            if (avgVoc >= 0f) SubScor(calcSubScorVoc(avgVoc), true) to 0.15f else null,
-            if (avgNox >= 0f) SubScor(calcSubScorNox(avgNox), true) to 0.10f else null
-        )
-
-        // Re-normalizăm ponderile dacă lipsesc date
-        val totalPondere = subScoruri.sumOf { it.second.toDouble() }.toFloat()
-        val scorPonderat = if (totalPondere > 0f) {
-            subScoruri.sumOf { (sub, pondere) -> (sub.valoare * pondere / totalPondere).toDouble() }.toFloat()
-        } else 100f
-
-        // Penalizare critică: dacă vreun poluant depășește pragul grav, taiem scorul
-        val penalizareCritica = when {
-            avgPm > 55f -> 15f
-            avgCo2 > 1500f -> 10f
-            avgVoc > 400f -> 8f
-            avgNox > 300f -> 5f
-            else -> 0f
+            // La fiecare moment: 50% cel mai slab poluant + 50% media ponderată a celor disponibili
+            if (sumaW > 0f) instScores.add(0.5f * worst + 0.5f * (sumaSW / sumaW))
         }
 
-        // Bonus dacă totul e în zona excelentă
-        val bonus = if (
-            (avgPm < 0f || avgPm <= 12f) &&
-            (avgCo2 < 0f || avgCo2 <= 700f) &&
-            (avgVoc < 0f || avgVoc <= 100f) &&
-            (avgNox < 0f || avgNox <= 20f)
-        ) 3f else 0f
+        if (instScores.isEmpty()) return@remember -1
 
-        (scorPonderat - penalizareCritica + bonus).coerceIn(0f, 100f).roundToInt()
+        val medieZi = instScores.average().toFloat()
+        // Media celor mai proaste ~10% probe (cel puțin 1) — captează perioadele de poluare
+        val sortate = instScores.sorted()
+        val nrProaste = maxOf(1, kotlin.math.ceil(instScores.size * 0.10f).toInt())
+        val medieProaste = sortate.take(nrProaste).average().toFloat()
+
+        // 70% condiții tipice + 30% cele mai proaste perioade
+        (0.70f * medieZi + 0.30f * medieProaste).coerceIn(0f, 100f).roundToInt()
     }
 
+    val areScor = scorFinal >= 0
     val colorScor = when {
+        !areScor -> textSecondary
         scorFinal >= 90 -> Color(0xFF4CAF50)   // Verde
         scorFinal >= 75 -> Color(0xFF8BC34A)   // Verde-gălbui
-        scorFinal >= 60 -> Color(0xFFFFC107)   // Galben
+        scorFinal >= 60 -> Color(0xFFFFF700)   // Galben
         scorFinal >= 40 -> Color(0xFFFF9800)   // Portocaliu
         else -> Color(0xFFF44336)              // Roșu
     }
     val mesaj = when {
+        !areScor -> "Se colectează date..."
         scorFinal >= 90 -> "Aer Excelent azi"
         scorFinal >= 75 -> "Aer Bun"
         scorFinal >= 60 -> "Calitate Medie, mai aerisește"
@@ -926,9 +1060,9 @@ fun CardScorZilnic(
         Box(contentAlignment = Alignment.Center, modifier = Modifier.size(60.dp)) {
             Canvas(modifier = Modifier.fillMaxSize()) {
                 drawArc(color = colorScor.copy(alpha = 0.2f), startAngle = 0f, sweepAngle = 360f, useCenter = false, style = Stroke(8.dp.toPx(), cap = StrokeCap.Round))
-                drawArc(color = colorScor, startAngle = -90f, sweepAngle = (scorFinal / 100f) * 360f, useCenter = false, style = Stroke(8.dp.toPx(), cap = StrokeCap.Round))
+                if (areScor) drawArc(color = colorScor, startAngle = -90f, sweepAngle = (scorFinal / 100f) * 360f, useCenter = false, style = Stroke(8.dp.toPx(), cap = StrokeCap.Round))
             }
-            Text("$scorFinal", color = textPrimary, fontWeight = FontWeight.Bold, fontSize = 20.sp)
+            Text(if (areScor) "$scorFinal" else "—", color = textPrimary, fontWeight = FontWeight.Bold, fontSize = 20.sp)
         }
         Spacer(Modifier.width(16.dp))
         Column {
@@ -1132,7 +1266,10 @@ fun EcranAcasa(
 
         val isAuto = speedControlServer == 0f
         val isOprit = localSliderValue < 5f && !isAuto
-        val displaySliderValue = if (isAuto) procentVentilatorServer.toFloat().coerceIn(1f, 100f) else localSliderValue.coerceIn(1f, 100f)
+        // În AUTO, cât timp utilizatorul trage de slider arătăm poziția degetului (preluare
+        // manuală), nu ținta de pe server — altfel thumb-ul nu urmărea degetul până la
+        // confirmarea round-trip-ului prin Firebase.
+        val displaySliderValue = if (isAuto && !isDragging) procentVentilatorServer.toFloat().coerceIn(1f, 100f) else localSliderValue.coerceIn(1f, 100f)
 
         Row(
             modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
@@ -1189,15 +1326,15 @@ fun EcranAcasa(
             prefs = prefs, surfaceColor = surfaceColor, textSecondary = textSecondary,
             categoryOrder = categoryOrder, onOrderChange = onOrderChange,
             contentPraf = {
-                SenzorCard("PM 1.0", animPm1, false, istoricPM1, intervalSelectat, false, null, false, textPrimary, textSecondary, tipGrafic, "PM1", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, trendPm1, lastHistoryTimeUnix) { v -> if (v == -999f) Color.Transparent else if (v < 10) Color.Green else if (v < 20) Color(0xFFFFC107) else if (v < 30) Color(0xFFFF9800) else Color.Red }
-                SenzorCard("PM 2.5", animPm25, false, istoricPM25, intervalSelectat, false, null, false, textPrimary, textSecondary, tipGrafic, "PM25", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, trendPm25, lastHistoryTimeUnix) { v -> if (v == -999f) Color.Transparent else if (v < 12) Color.Green else if (v < 35) Color(0xFFFFC107) else if (v < 55) Color(0xFFFF9800) else Color.Red }
-                SenzorCard("PM 4.0", animPm4, false, istoricPM4, intervalSelectat, false, null, false, textPrimary, textSecondary, tipGrafic, "PM4", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, trendPm4, lastHistoryTimeUnix) { v -> if (v == -999f) Color.Transparent else if (v < 25) Color.Green else if (v < 50) Color(0xFFFFC107) else if (v < 75) Color(0xFFFF9800) else Color.Red }
-                SenzorCard("PM 10", animPm10, false, istoricPM10, intervalSelectat, false, null, false, textPrimary, textSecondary, tipGrafic, "PM10", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, trendPm10, lastHistoryTimeUnix) { v -> if (v == -999f) Color.Transparent else if (v < 50) Color.Green else if (v < 100) Color(0xFFFFC107) else if (v < 150) Color(0xFFFF9800) else Color.Red }
+                SenzorCard("PM 1.0", animPm1, false, istoricPM1, intervalSelectat, false, null, false, textPrimary, textSecondary, tipGrafic, "PM1", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, trendPm1, lastHistoryTimeUnix) { v -> if (v == -999f) Color.Transparent else if (v < 3) Color(0XFF40CE19) else if (v < 8) Color(0xFFFAF250) else if (v < 25) Color(0xFFF5961A) else Color(0xFFE21E1E) }
+                SenzorCard("PM 2.5", animPm25, false, istoricPM25, intervalSelectat, false, null, false, textPrimary, textSecondary, tipGrafic, "PM25", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, trendPm25, lastHistoryTimeUnix) { v -> if (v == -999f) Color.Transparent else if (v < 5) Color(0XFF40CE19) else if (v < 12) Color(0xFFFAF250) else if (v < 35) Color(0xFFF5961A) else Color(0xFFE21E1E) }
+                SenzorCard("PM 4.0", animPm4, false, istoricPM4, intervalSelectat, false, null, false, textPrimary, textSecondary, tipGrafic, "PM4", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, trendPm4, lastHistoryTimeUnix) { v -> if (v == -999f) Color.Transparent else if (v < 10) Color(0XFF40CE19) else if (v < 25) Color(0xFFFAF250) else if (v < 50) Color(0xFFF5961A) else Color(0xFFE21E1E) }
+                SenzorCard("PM 10", animPm10, false, istoricPM10, intervalSelectat, false, null, false, textPrimary, textSecondary, tipGrafic, "PM10", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, trendPm10, lastHistoryTimeUnix) { v -> if (v == -999f) Color.Transparent else if (v < 15) Color(0XFF40CE19) else if (v < 45) Color(0xFFFAF250) else if (v < 100) Color(0xFFF5961A) else Color(0xFFE21E1E) }
             },
             contentGaze = {
-                SenzorCard("CO2 (ppm)", animCo2, false, istoricCO2, intervalSelectat, false, null, true, textPrimary, textSecondary, tipGrafic, "CO2", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, trendCo2, lastHistoryTimeUnix) { v -> if (v == -999f) Color.Transparent else if (v < 800) Color.Green else if (v < 1000) Color(0xFFFFC107) else if (v < 1500) Color(0xFFFF9800) else Color.Red }
-                SenzorCard("VOC (Index)", animVoc, voc > 1000f, istoricVOC, intervalSelectat, false, null, true, textPrimary, textSecondary, tipGrafic, "VOC", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, trendVoc, lastHistoryTimeUnix) { v -> if (v == -999f) Color.Transparent else if (v < 150) Color.Green else if (v < 250) Color(0xFFFFC107) else if (v < 400) Color(0xFFFF9800) else Color.Red }
-                SenzorCard("NOx (Index)", animNox, nox > 1000f, istoricNOx, intervalSelectat, false, null, true, textPrimary, textSecondary, tipGrafic, "NOx", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, trendNox, lastHistoryTimeUnix) { v -> if (v == -999f) Color.Transparent else if (v < 20) Color.Green else if (v < 150) Color(0xFFFFC107) else if (v < 300) Color(0xFFFF9800) else Color.Red }
+                SenzorCard("CO2 (ppm)", animCo2, false, istoricCO2, intervalSelectat, false, null, true, textPrimary, textSecondary, tipGrafic, "CO2", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, trendCo2, lastHistoryTimeUnix) { v -> if (v == -999f) Color.Transparent else if (v < 800) Color(0XFF40CE19) else if (v < 1200) Color(0xFFFAF250) else if (v < 1600) Color(0xFFF5961A) else Color(0xFFE21E1E) }
+                SenzorCard("VOC (Index)", animVoc, voc > 1000f, istoricVOC, intervalSelectat, false, 500f, true, textPrimary, textSecondary, tipGrafic, "VOC", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, trendVoc, lastHistoryTimeUnix, esteIndex = true) { v -> if (v == -999f) Color.Transparent else if (v < 150) Color(0XFF40CE19) else if (v < 250) Color(0xFFFAF250) else if (v < 400) Color(0xFFF5961A) else Color(0xFFE21E1E) }
+                SenzorCard("NOx (Index)", animNox, nox > 1000f, istoricNOx, intervalSelectat, false, 500f, true, textPrimary, textSecondary, tipGrafic, "NOx", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, trendNox, lastHistoryTimeUnix, esteIndex = true) { v -> if (v == -999f) Color.Transparent else if (v < 20) Color(0XFF40CE19) else if (v < 150) Color(0xFFFAF250) else if (v < 300) Color(0xFFF5961A) else Color(0xFFE21E1E) }
             },
             contentClima = {
                 SenzorCard("Temperatură (°C)", animTemp, false, istoricTemp, intervalSelectat, false, null, false, textPrimary, textSecondary, tipGrafic, "Temp", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.TEMPERATURE, trendTemp, lastHistoryTimeUnix, douaZecimaleLive = true, colorLogic = ::getTempColor)
@@ -1210,6 +1347,17 @@ fun EcranAcasa(
     }
 }
 
+// Parseaza un nod-zi din arhiva in cele 6 serii folosite de grafice (helper comun
+// pentru listenerul de 28 de zile si pentru incarcarea la cerere a istoricului vechi).
+private fun parseZiArhiva(ziSnap: DataSnapshot): Map<String, List<Float>> = mapOf(
+    "PM25" to parseIstoric(ziSnap.child("PM25").getValue(String::class.java)),
+    "CO2" to parseIstoric(ziSnap.child("CO2").getValue(String::class.java)),
+    "VOC" to parseIstoric(ziSnap.child("VOC").getValue(String::class.java), true),
+    "NOx" to parseIstoric(ziSnap.child("NOx").getValue(String::class.java), true),
+    "Temp" to parseIstoric(ziSnap.child("Temp").getValue(String::class.java)),
+    "RH" to parseIstoric(ziSnap.child("Umid").getValue(String::class.java))
+)
+
 // ================= TAB 2: ARHIVĂ =================
 @Composable
 fun EcranArhiva(
@@ -1217,11 +1365,29 @@ fun EcranArhiva(
     database: DatabaseReference, accentColor: Color, textPrimary: Color, textSecondary: Color,
     surfaceColor: Color, dividerColor: Color, tipGrafic: Int
 ) {
-    var arhivaData by remember { mutableStateOf<Map<String, Map<String, List<Float>>>>(emptyMap()) }
-    var listaZileReale by remember { mutableStateOf<List<Pair<String, LocalDate>>>(emptyList()) }
+    // Doua surse: "recenta" (cele 4 saptamani afisate, in timp real, randare INSTANT din cache)
+    // si "veche" (restul istoricului, incarcat O SINGURA DATA cu .get() abia cand utilizatorul
+    // navigheaza in trecut). Asa pagina se deschide instant, iar arhiva veche nu se descarca
+    // degeaba daca nu te uiti la ea.
+    var arhivaRecenta by remember { mutableStateOf<Map<String, Map<String, List<Float>>>>(emptyMap()) }
+    var listaRecenta by remember { mutableStateOf<List<Pair<String, LocalDate>>>(emptyList()) }
+    var arhivaVeche by remember { mutableStateOf<Map<String, Map<String, List<Float>>>>(emptyMap()) }
+    var listaVeche by remember { mutableStateOf<List<Pair<String, LocalDate>>>(emptyList()) }
+    var istoricExtinsIncarcat by remember { mutableStateOf(false) }
+    var seIncarcaIstoric by remember { mutableStateOf(false) }
+    var existaIstoricMaiVechi by remember { mutableStateOf(false) }
+
     var saptamanaSelectata by remember { mutableStateOf<LocalDate?>(null) }
     var ziSelectata by remember { mutableStateOf<String?>(null) }
+    var paginaSaptamani by remember { mutableIntStateOf(0) }   // 0 = cele mai recente 4 saptamani
     val formatter = DateTimeFormatter.ofPattern("yyyy_MM_dd")
+
+    // Fereastra implicita = EXACT cele 4 saptamani afisate (luni a saptamanii -3 -> azi), nu
+    // "ultimele 28 de zile": 28 de zile ar prinde si 1-2 zile dintr-a 5-a saptamana calendaristica
+    // (descarcand mai mult si facand pagina -1 sa para deja in memorie).
+    val luniCurenta = remember { LocalDate.now().with(DayOfWeek.MONDAY) }
+    val startKey = remember(luniCurenta) { luniCurenta.minusWeeks(3).format(formatter) }
+    val endKeyVechi = remember(luniCurenta) { luniCurenta.minusWeeks(3).minusDays(1).format(formatter) }
 
     var globalTouchIndex by remember { mutableStateOf<Int?>(null) }
     var activeChartId by remember { mutableStateOf<String?>(null) }
@@ -1235,41 +1401,116 @@ fun EcranArhiva(
                 for (ziSnap in snapshot.children) {
                     val key = ziSnap.key ?: continue
                     try {
-                        val dateObj = LocalDate.parse(key, formatter)
-                        zileParsate.add(key to dateObj)
-                        mapNou[key] = mapOf(
-                            "PM25" to parseIstoric(ziSnap.child("PM25").getValue(String::class.java)),
-                            "CO2" to parseIstoric(ziSnap.child("CO2").getValue(String::class.java)),
-                            "VOC" to parseIstoric(ziSnap.child("VOC").getValue(String::class.java), true),
-                            "NOx" to parseIstoric(ziSnap.child("NOx").getValue(String::class.java), true),
-                            "Temp" to parseIstoric(ziSnap.child("Temp").getValue(String::class.java)),
-                            "RH" to parseIstoric(ziSnap.child("Umid").getValue(String::class.java))
-                        )
+                        zileParsate.add(key to LocalDate.parse(key, formatter))
+                        mapNou[key] = parseZiArhiva(ziSnap)
                     } catch (_: Exception) { continue }
                 }
-                arhivaData = mapNou
-                listaZileReale = zileParsate
-                if (zileParsate.isNotEmpty()) {
+                arhivaRecenta = mapNou
+                listaRecenta = zileParsate
+                // Selectie initiala doar daca nu am ales inca nimic (NU resetam cand userul
+                // s-a dus deja in istoric — altfel l-am smulge inapoi la zi cand se refac datele).
+                if (saptamanaSelectata == null && zileParsate.isNotEmpty()) {
                     val ultimaZi = zileParsate.last()
-                    val saptamanaUltimeiZile = ultimaZi.second.with(DayOfWeek.MONDAY)
-                    if (saptamanaSelectata == null || zileParsate.none { it.first == ziSelectata }) {
-                        saptamanaSelectata = saptamanaUltimeiZile
-                        ziSelectata = ultimaZi.first
-                    }
+                    saptamanaSelectata = ultimaZi.second.with(DayOfWeek.MONDAY)
+                    ziSelectata = ultimaZi.first
                 }
             }
             override fun onCancelled(error: DatabaseError) {}
         }
-        val query = database.child("Arhiva_Zilnica").orderByKey().limitToLast(28)
+        // Doar cele 4 saptamani afisate (de la luni a saptamanii -3) -> randare instant din cache.
+        val query = database.child("Arhiva_Zilnica").orderByKey().startAt(startKey)
         query.addValueEventListener(listener)
         onDispose { query.removeEventListener(listener) }
     }
 
+    // Verificam IEFTIN (o singura zi) daca exista arhiva mai veche decat fereastra afisata,
+    // ca sa stim daca aratam sageata inapoi — fara a descarca tot istoricul.
+    LaunchedEffect(endKeyVechi) {
+        database.child("Arhiva_Zilnica").orderByKey().endAt(endKeyVechi).limitToLast(1).get()
+            .addOnSuccessListener { existaIstoricMaiVechi = it.hasChildren() }
+    }
+
+    // Vederile combinate (vechi + recent; recentul are prioritate la suprapuneri).
+    val arhivaData = remember(arhivaVeche, arhivaRecenta) { arhivaVeche + arhivaRecenta }
+    val listaZileReale = remember(listaVeche, listaRecenta) {
+        (listaVeche + listaRecenta).distinctBy { it.first }.sortedBy { it.second }
+    }
     val saptamaniMap = remember(listaZileReale) { listaZileReale.groupBy { it.second.with(DayOfWeek.MONDAY) } }
-    val saptamaniValide = remember(saptamaniMap) { saptamaniMap.keys.sorted().takeLast(4) }
+    val toateSaptamanile = remember(saptamaniMap) { saptamaniMap.keys.sorted() }
+    val saptamaniValide = remember(toateSaptamanile, paginaSaptamani) {
+        toateSaptamanile.dropLast(paginaSaptamani * 4).takeLast(4)
+    }
+    val existaSaptamaniMaiVechi = toateSaptamanile.size > (paginaSaptamani + 1) * 4
+    // Mai exista istoric dincolo de fereastra afisata, neadus inca? (din proba ieftina de mai sus)
+    val potExtindeIstoric = !istoricExtinsIncarcat && existaIstoricMaiVechi
+
+    fun selecteazaPagina(pagina: Int) {
+        val vizibile = toateSaptamanile.dropLast(pagina * 4).takeLast(4)
+        if (vizibile.isEmpty()) return
+        paginaSaptamani = pagina
+        vizibile.lastOrNull()?.let { sapt ->
+            saptamanaSelectata = sapt
+            ziSelectata = saptamaniMap[sapt]?.last()?.first
+        }
+    }
+
+    // Incarca O SINGURA DATA tot istoricul ramas si avanseaza imediat la pagina urmatoare,
+    // selectand corect din lista deja completa (fara a depinde de o recompunere ulterioara).
+    fun extindeSiAvanseaza() {
+        if (seIncarcaIstoric) return
+        seIncarcaIstoric = true
+        database.child("Arhiva_Zilnica").get().addOnSuccessListener { snapshot ->
+            val mapNou = mutableMapOf<String, Map<String, List<Float>>>()
+            val zile = mutableListOf<Pair<String, LocalDate>>()
+            for (ziSnap in snapshot.children) {
+                val key = ziSnap.key ?: continue
+                try { zile.add(key to LocalDate.parse(key, formatter)); mapNou[key] = parseZiArhiva(ziSnap) } catch (_: Exception) { continue }
+            }
+            arhivaVeche = mapNou; listaVeche = zile
+            istoricExtinsIncarcat = true; seIncarcaIstoric = false
+            val combinat = (zile + listaRecenta).distinctBy { it.first }.sortedBy { it.second }
+            val toate = combinat.map { it.second.with(DayOfWeek.MONDAY) }.distinct().sorted()
+            val tinta = paginaSaptamani + 1
+            val vizibile = toate.dropLast(tinta * 4).takeLast(4)
+            if (vizibile.isNotEmpty()) {
+                paginaSaptamani = tinta
+                val sapt = vizibile.last()
+                saptamanaSelectata = sapt
+                ziSelectata = combinat.filter { it.second.with(DayOfWeek.MONDAY) == sapt }.maxByOrNull { it.second }?.first
+            }
+        }.addOnFailureListener { seIncarcaIstoric = false }
+    }
 
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-        Text("ARHIVĂ CALITATE AER", color = textSecondary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            Text("ARHIVĂ CALITATE AER", color = textSecondary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (existaSaptamaniMaiVechi || potExtindeIstoric) {
+                    Box(
+                        modifier = Modifier.width(44.dp).height(26.dp).clip(RoundedCornerShape(8.dp))
+                            .background(surfaceColor)
+                            .clickable(enabled = !seIncarcaIstoric) {
+                                if (existaSaptamaniMaiVechi) selecteazaPagina(paginaSaptamani + 1)
+                                else extindeSiAvanseaza()   // prima coborare in istoricul vechi: il aducem acum
+                            },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (seIncarcaIstoric) CircularProgressIndicator(color = textSecondary, strokeWidth = 2.dp, modifier = Modifier.size(14.dp))
+                        else Icon(Icons.AutoMirrored.Filled.KeyboardArrowLeft, contentDescription = "Săptămânile anterioare", tint = textSecondary, modifier = Modifier.size(20.dp))
+                    }
+                }
+                if (paginaSaptamani > 0) {
+                    Box(
+                        modifier = Modifier.width(44.dp).height(26.dp).clip(RoundedCornerShape(8.dp))
+                            .background(surfaceColor)
+                            .clickable { selecteazaPagina(paginaSaptamani - 1) },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = "Săptămânile următoare", tint = textSecondary, modifier = Modifier.size(20.dp))
+                    }
+                }
+            }
+        }
         Spacer(modifier = Modifier.height(12.dp))
         if (saptamaniValide.isEmpty()) {
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("Arhivă goală", color = textSecondary) }
@@ -1334,12 +1575,12 @@ fun EcranArhiva(
                 prefs = prefs, surfaceColor = surfaceColor, textSecondary = textSecondary,
                 categoryOrder = categoryOrder, onOrderChange = onOrderChange,
                 contentPraf = {
-                    SenzorCard("PM 2.5 (Praf)", 0f, true, dateZi["PM25"] ?: emptyList(), IntervalTimp.ORE_24, true, null, false, textPrimary, textSecondary, tipGrafic, "AR_PM25", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, 0, 0L) { v -> if (v == -999f) Color.Transparent else if (v < 12) Color.Green else if (v < 35) Color(0xFFFFC107) else if (v < 55) Color(0xFFFF9800) else Color.Red }
+                    SenzorCard("PM 2.5 (Praf)", 0f, true, dateZi["PM25"] ?: emptyList(), IntervalTimp.ORE_24, true, null, false, textPrimary, textSecondary, tipGrafic, "AR_PM25", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, 0, 0L) { v -> if (v == -999f) Color.Transparent else if (v < 5) Color(0XFF40CE19) else if (v < 12) Color(0xFFFAF250) else if (v < 35) Color(0xFFF5961A) else Color(0xFFE21E1E) }
                 },
                 contentGaze = {
-                    SenzorCard("CO2 (Dioxid de Carbon)", 0f, true, dateZi["CO2"] ?: emptyList(), IntervalTimp.ORE_24, true, null, true, textPrimary, textSecondary, tipGrafic, "AR_CO2", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, 0, 0L) { v -> if (v == -999f) Color.Transparent else if (v < 800) Color.Green else if (v < 1000) Color(0xFFFFC107) else if (v < 1500) Color(0xFFFF9800) else Color.Red }
-                    SenzorCard("VOC (Chimicale)", 0f, true, dateZi["VOC"] ?: emptyList(), IntervalTimp.ORE_24, true, null, true, textPrimary, textSecondary, tipGrafic, "AR_VOC", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, 0, 0L) { v -> if (v == -999f) Color.Transparent else if (v < 150) Color.Green else if (v < 250) Color(0xFFFFC107) else if (v < 400) Color(0xFFFF9800) else Color.Red }
-                    SenzorCard("NOx (Gaze eșapament)", 0f, true, dateZi["NOx"] ?: emptyList(), IntervalTimp.ORE_24, true, null, true, textPrimary, textSecondary, tipGrafic, "AR_NOx", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, 0, 0L) { v -> if (v == -999f) Color.Transparent else if (v < 20) Color.Green else if (v < 150) Color(0xFFFFC107) else if (v < 300) Color(0xFFFF9800) else Color.Red }
+                    SenzorCard("CO2 (Dioxid de Carbon)", 0f, true, dateZi["CO2"] ?: emptyList(), IntervalTimp.ORE_24, true, null, true, textPrimary, textSecondary, tipGrafic, "AR_CO2", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, 0, 0L) { v -> if (v == -999f) Color.Transparent else if (v < 800) Color(0XFF40CE19) else if (v < 1200) Color(0xFFFAF250) else if (v < 1600) Color(0xFFF5961A) else Color(0xFFE21E1E) }
+                    SenzorCard("VOC (Chimicale)", 0f, true, dateZi["VOC"] ?: emptyList(), IntervalTimp.ORE_24, true, 500f, true, textPrimary, textSecondary, tipGrafic, "AR_VOC", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, 0, 0L, esteIndex = true) { v -> if (v == -999f) Color.Transparent else if (v < 150) Color(0XFF40CE19) else if (v < 250) Color(0xFFFAF250) else if (v < 400) Color(0xFFF5961A) else Color(0xFFE21E1E) }
+                    SenzorCard("NOx (Gaze eșapament)", 0f, true, dateZi["NOx"] ?: emptyList(), IntervalTimp.ORE_24, true, 500f, true, textPrimary, textSecondary, tipGrafic, "AR_NOx", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, 0, 0L, esteIndex = true) { v -> if (v == -999f) Color.Transparent else if (v < 20) Color(0XFF40CE19) else if (v < 150) Color(0xFFFAF250) else if (v < 300) Color(0xFFF5961A) else Color(0xFFE21E1E) }
                 },
                 contentClima = {
                     SenzorCard("Temperatură (°C)", 0f, true, dateZi["Temp"] ?: emptyList(), IntervalTimp.ORE_24, true, null, false, textPrimary, textSecondary, tipGrafic, "AR_Temp", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.TEMPERATURE, 0, 0L, colorLogic = ::getTempColor)
@@ -1354,7 +1595,7 @@ fun EcranArhiva(
 // ================= TAB 3: SETĂRI =================
 @Composable
 fun EcranSetari(
-    context: Context, prefs: SharedPreferences, nightModeActiv: Boolean, liveModeActiv: Boolean,
+    context: Context, prefs: SharedPreferences, database: DatabaseReference, nightModeActiv: Boolean, liveModeActiv: Boolean,
     notifPraf: Boolean, notifGaze: Boolean, notifOffline: Boolean, errorLogString: String, runInBackground: Boolean,
     isDarkMode: Boolean, accentColor: Color, tipGrafic: Int, textPrimary: Color, textSecondary: Color, surfaceColor: Color,
     istoricExportPM: List<Float>, istoricExportCO2: List<Float>, dividerColor: Color,
@@ -1365,7 +1606,7 @@ fun EcranSetari(
     onNotifGazeChange: (Boolean) -> Unit, onNotifOfflineChange: (Boolean) -> Unit, onRunInBackgroundChange: (Boolean) -> Unit,
     onThemeChange: (Boolean) -> Unit, onColorChange: (Int) -> Unit, onTipGraficChange: (Int) -> Unit,
     onCleanSensor: () -> Unit, onRestartBoard: () -> Unit,
-    onTempOffsetChange: (Float) -> Unit, onResetCalibrari: () -> Unit
+    onTempOffsetChange: (Float) -> Unit, onResetVoc: () -> Unit, onCalibrareCo2: () -> Unit
 ) {
     // FIX: Toate dialogurile folosesc acum `var` simplu — elimină warningul "Assigned value is never read"
     // care apărea din cauza destructuring-ului `val (show, setShow) = remember { mutableStateOf(false) }`
@@ -1373,7 +1614,8 @@ fun EcranSetari(
     var showCleanDialog by remember { mutableStateOf(false) }
     var showRestartDialog by remember { mutableStateOf(false) }
     var showErrorDialog by remember { mutableStateOf(false) }
-    var showResetCalibDialog by remember { mutableStateOf(false) }
+    var showResetVocDialog by remember { mutableStateOf(false) }
+    var showCalibCo2Dialog by remember { mutableStateOf(false) }
     var showExportDialog by remember { mutableStateOf(false) }
     var isExporting by remember { mutableStateOf(false) }
     var csvContentToSave by remember { mutableStateOf("") }
@@ -1403,13 +1645,23 @@ fun EcranSetari(
             containerColor = surfaceColor, titleContentColor = textPrimary, textContentColor = textPrimary
         )
     }
-    if (showResetCalibDialog) {
+    if (showResetVocDialog) {
         AlertDialog(
-            onDismissRequest = { showResetCalibDialog = false },
-            title = { Text("Resetare Calibrări", fontWeight = FontWeight.Bold, color = Color.Red) },
-            text = { Text("Atenție! Această acțiune va șterge permanent memoria internă a algoritmului VOC. Senzorul va avea nevoie de 12-24 de ore să se re-calibreze. Aparatul se va restarta automat. Ești sigur?") },
-            confirmButton = { TextButton(onClick = { showResetCalibDialog = false; onResetCalibrari() }) { Text("Resetare", color = Color.Red) } },
-            dismissButton = { TextButton(onClick = { showResetCalibDialog = false }) { Text("Anulează", color = textSecondary) } },
+            onDismissRequest = { showResetVocDialog = false },
+            title = { Text("Resetare Calibrare VOC", fontWeight = FontWeight.Bold, color = Color.Red) },
+            text = { Text("Această acțiune șterge permanent memoria învățată a algoritmului VOC. Senzorul va avea nevoie de 12-24 de ore să se re-calibreze singur. Aparatul se restartează automat. Ești sigur?") },
+            confirmButton = { TextButton(onClick = { showResetVocDialog = false; onResetVoc() }) { Text("Resetare", color = Color.Red) } },
+            dismissButton = { TextButton(onClick = { showResetVocDialog = false }) { Text("Anulează", color = textSecondary) } },
+            containerColor = surfaceColor, titleContentColor = textPrimary, textContentColor = textPrimary
+        )
+    }
+    if (showCalibCo2Dialog) {
+        AlertDialog(
+            onDismissRequest = { showCalibCo2Dialog = false },
+            title = { Text("Calibrare CO2 (aer proaspăt)", fontWeight = FontWeight.Bold) },
+            text = { Text("Senzorul de CO2 va fi recalibrat forțat (FRC) la nivelul aerului curat de afară (~420 ppm).\n\nIMPORTANT: ține aparatul PORNIT la aer proaspăt — geam larg deschis sau afară — cel puțin 3 minute ÎNAINTE de a apăsa Calibrează. Altfel calibrarea va ieși greșită!\n\nRezultatul e permanent, măsurarea continuă imediat (fără restart), iar corecția aplicată apare în Jurnalul de Erori. Continui?") },
+            confirmButton = { TextButton(onClick = { showCalibCo2Dialog = false; onCalibrareCo2() }) { Text("Calibrează", color = accentColor) } },
+            dismissButton = { TextButton(onClick = { showCalibCo2Dialog = false }) { Text("Anulează", color = textSecondary) } },
             containerColor = surfaceColor, titleContentColor = textPrimary, textContentColor = textPrimary
         )
     }
@@ -1498,7 +1750,7 @@ fun EcranSetari(
                         Button(
                             onClick = {
                                 isExporting = true
-                                val db = FirebaseDatabase.getInstance("https://YOUR_PROJECT-default-rtdb.firebasedatabase.app/").getReference("SenzoriAer/Arhiva_Zilnica")
+                                val db = FirebaseDatabase.getInstance(WIDGET_DB_URL).getReference("SenzoriAer/Arhiva_Zilnica")
                                 db.get().addOnSuccessListener { snapshot ->
                                     val sb = StringBuilder().apply {
                                         append("Data,Ora,PM2.5,CO2_ppm,VOC_Index,NOx_Index,Temp_C,Umiditate_RH\n")
@@ -1510,11 +1762,21 @@ fun EcranSetari(
                                             val noxList = parseIstoric(ziSnap.child("NOx").getValue(String::class.java), true)
                                             val tempList = parseIstoric(ziSnap.child("Temp").getValue(String::class.java))
                                             val humList = parseIstoric(ziSnap.child("Umid").getValue(String::class.java))
-                                            for (i in pmList.indices) {
+                                            // Randul se scrie daca ORICARE serie are valoare la slotul i (inainte se
+                                            // sarea tot randul cand lipsea PM2.5 si se pierdeau CO2/Temp valide);
+                                            // valorile lipsa raman celule goale, nu -999.
+                                            val celula = { v: Float, intreg: Boolean -> if (v == -999f) "" else if (intreg) "${v.toInt()}" else "$v" }
+                                            val nrSloturi = maxOf(pmList.size, co2List.size, vocList.size, noxList.size, tempList.size, humList.size)
+                                            for (i in 0 until nrSloturi) {
                                                 val pm = pmList.getOrNull(i) ?: -999f
-                                                if (pm == -999f) continue
+                                                val co2V = co2List.getOrNull(i) ?: -999f
+                                                val vocV = vocList.getOrNull(i) ?: -999f
+                                                val noxV = noxList.getOrNull(i) ?: -999f
+                                                val tempV = tempList.getOrNull(i) ?: -999f
+                                                val humV = humList.getOrNull(i) ?: -999f
+                                                if (pm == -999f && co2V == -999f && vocV == -999f && noxV == -999f && tempV == -999f && humV == -999f) continue
                                                 val totalMin = i * 5
-                                                append("$dateStr,${"%02d:%02d".format(totalMin / 60, totalMin % 60)},$pm,${(co2List.getOrNull(i) ?: -999f).toInt()},${(vocList.getOrNull(i) ?: -999f).toInt()},${(noxList.getOrNull(i) ?: -999f).toInt()},${tempList.getOrNull(i) ?: -999f},${humList.getOrNull(i) ?: -999f}\n")
+                                                append("$dateStr,${"%02d:%02d".format(totalMin / 60, totalMin % 60)},${celula(pm, false)},${celula(co2V, true)},${celula(vocV, true)},${celula(noxV, true)},${celula(tempV, false)},${celula(humV, false)}\n")
                                             }
                                         }
                                     }
@@ -1534,9 +1796,10 @@ fun EcranSetari(
         )
     }
 
-    // Dialog prag PM2.5
+    // Dialog prag PM2.5 (alertPmState tine descrierea switch-ului sincronizata dupa salvare)
     var showPmDialog by remember { mutableStateOf(false) }
-    var pmVal by remember { mutableStateOf(prefs.getFloat("alertPm", 35f).toInt().toString()) }
+    var pmVal by remember { mutableStateOf(prefs.getFloat("alertPm", 20f).toInt().toString()) }
+    var alertPmState by remember { mutableFloatStateOf(prefs.getFloat("alertPm", 20f)) }
     if (showPmDialog) {
         AlertDialog(
             onDismissRequest = { showPmDialog = false },
@@ -1548,7 +1811,7 @@ fun EcranSetari(
                     colors = OutlinedTextFieldDefaults.colors(focusedTextColor = textPrimary, unfocusedTextColor = textPrimary, cursorColor = accentColor, focusedBorderColor = accentColor, unfocusedBorderColor = textSecondary, focusedLabelColor = accentColor, unfocusedLabelColor = textSecondary)
                 )
             },
-            confirmButton = { TextButton(onClick = { pmVal.toFloatOrNull()?.let { prefs.edit(commit = true) { putFloat("alertPm", it) } }; showPmDialog = false }) { Text("Salvează", color = accentColor) } },
+            confirmButton = { TextButton(onClick = { pmVal.toFloatOrNull()?.let { prefs.edit(commit = true) { putFloat("alertPm", it) }; alertPmState = it; database.child("setari/alert_pm").setValue(it.toDouble()) }; showPmDialog = false }) { Text("Salvează", color = accentColor) } },
             dismissButton = { TextButton(onClick = { showPmDialog = false }) { Text("Anulează", color = textSecondary) } },
             containerColor = surfaceColor, titleContentColor = textPrimary, textContentColor = textPrimary
         )
@@ -1556,9 +1819,9 @@ fun EcranSetari(
 
     // Dialog praguri gaze
     var showGazeDialog by remember { mutableStateOf(false) }
-    var co2Val by remember { mutableStateOf(prefs.getFloat("alertCo2", 1500f).toInt().toString()) }
+    var co2Val by remember { mutableStateOf(prefs.getFloat("alertCo2", 1600f).toInt().toString()) }
     var vocVal by remember { mutableStateOf(prefs.getFloat("alertVoc", 250f).toInt().toString()) }
-    var noxVal by remember { mutableStateOf(prefs.getFloat("alertNox", 150f).toInt().toString()) }
+    var noxVal by remember { mutableStateOf(prefs.getFloat("alertNox", 30f).toInt().toString()) }
     if (showGazeDialog) {
         AlertDialog(
             onDismissRequest = { showGazeDialog = false },
@@ -1572,9 +1835,9 @@ fun EcranSetari(
             },
             confirmButton = {
                 TextButton(onClick = {
-                    co2Val.toFloatOrNull()?.let { prefs.edit(commit = true) { putFloat("alertCo2", it) } }
-                    vocVal.toFloatOrNull()?.let { prefs.edit(commit = true) { putFloat("alertVoc", it) } }
-                    noxVal.toFloatOrNull()?.let { prefs.edit(commit = true) { putFloat("alertNox", it) } }
+                    co2Val.toFloatOrNull()?.let { prefs.edit(commit = true) { putFloat("alertCo2", it) }; database.child("setari/alert_co2").setValue(it.toInt()) }
+                    vocVal.toFloatOrNull()?.let { prefs.edit(commit = true) { putFloat("alertVoc", it) }; database.child("setari/alert_voc").setValue(it.toDouble()) }
+                    noxVal.toFloatOrNull()?.let { prefs.edit(commit = true) { putFloat("alertNox", it) }; database.child("setari/alert_nox").setValue(it.toDouble()) }
                     showGazeDialog = false
                 }) { Text("Salvează", color = accentColor) }
             },
@@ -1597,8 +1860,8 @@ fun EcranSetari(
         var isLedLuminDragging by remember { mutableStateOf(false) }
         LaunchedEffect(luminozitateServer) { if (!isLuminDragging) localLumin = luminozitateServer.toFloat() }
         LaunchedEffect(luminozitateLedServer) { if (!isLedLuminDragging) localLedLumin = (luminozitateLedServer / 2.55f).coerceIn(0f, 100f) }
-        val startDialog = TimePickerDialog(context, { _, h, m -> startHr = h; startMin = m; prefs.edit(commit = true) { putInt("nmStartHr", h); putInt("nmStartMin", m) } }, startHr, startMin, true)
-        val endDialog = TimePickerDialog(context, { _, h, m -> endHr = h; endMin = m; prefs.edit(commit = true) { putInt("nmEndHr", h); putInt("nmEndMin", m) } }, endHr, endMin, true)
+        val startDialog = TimePickerDialog(context, { _, h, m -> startHr = h; startMin = m; prefs.edit(commit = true) { putInt("nmStartHr", h); putInt("nmStartMin", m) }; database.child("setari/nm_start").setValue(h * 60 + m) }, startHr, startMin, true)
+        val endDialog = TimePickerDialog(context, { _, h, m -> endHr = h; endMin = m; prefs.edit(commit = true) { putInt("nmEndHr", h); putInt("nmEndMin", m) }; database.child("setari/nm_end").setValue(h * 60 + m) }, endHr, endMin, true)
         AlertDialog(
             onDismissRequest = { showNightModeDialog = false },
             title = { Text("Setări Ecran & Night Mode", fontWeight = FontWeight.Bold) },
@@ -1614,7 +1877,7 @@ fun EcranSetari(
                         Text("Automatizare Night Mode", color = textPrimary, fontSize = 14.sp, fontWeight = FontWeight.Medium)
                         Switch(
                             checked = autoNightMode,
-                            onCheckedChange = { autoNightMode = it; prefs.edit(commit = true) { putBoolean("nightModeAuto", it) } },
+                            onCheckedChange = { autoNightMode = it; prefs.edit(commit = true) { putBoolean("nightModeAuto", it) }; database.child("setari/nm_auto").setValue(it) },
                             modifier = Modifier.scale(0.7f).height(24.dp),
                             colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = accentColor, uncheckedThumbColor = Color(0xFF8E8E93), uncheckedTrackColor = if (surfaceColor == Color.White) Color(0xFFE5E5EA) else Color(0xFF3A3A3C), uncheckedBorderColor = Color.Transparent)
                         )
@@ -1740,7 +2003,8 @@ fun EcranSetari(
 
         Button(onClick = { showErrorDialog = true }, colors = ButtonDefaults.buttonColors(containerColor = surfaceColor), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) { Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Info, null, tint = Color(0xFFFF9500)); Spacer(Modifier.width(16.dp)); Text("Jurnal Erori (Ultimele 24h)", color = textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium) } }
         Button(onClick = { showRestartDialog = true }, colors = ButtonDefaults.buttonColors(containerColor = surfaceColor), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) { Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Warning, null, tint = Color.Red); Spacer(Modifier.width(16.dp)); Text("Restartare Sistem", color = Color.Red, fontSize = 16.sp, fontWeight = FontWeight.Medium) } }
-        Button(onClick = { showResetCalibDialog = true }, colors = ButtonDefaults.buttonColors(containerColor = surfaceColor), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) { Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Refresh, null, tint = Color(0xFFFF9500)); Spacer(Modifier.width(16.dp)); Text("Resetare Calibrări VOC", color = textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium) } }
+        Button(onClick = { showResetVocDialog = true }, colors = ButtonDefaults.buttonColors(containerColor = surfaceColor), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) { Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Refresh, null, tint = Color(0xFFFF9500)); Spacer(Modifier.width(16.dp)); Text("Resetare Calibrare VOC", color = textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium) } }
+        Button(onClick = { showCalibCo2Dialog = true }, colors = ButtonDefaults.buttonColors(containerColor = surfaceColor), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) { Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Refresh, null, tint = Color(0xFF34C759)); Spacer(Modifier.width(16.dp)); Text("Calibrare CO2 (aer proaspăt)", color = textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium) } }
         Button(onClick = { showCleanDialog = true }, colors = ButtonDefaults.buttonColors(containerColor = surfaceColor), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) { Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Settings, null, tint = accentColor); Spacer(Modifier.width(16.dp)); Text("Curățare Senzor SEN66", color = textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium) } }
         Button(onClick = { showExportDialog = true }, colors = ButtonDefaults.buttonColors(containerColor = surfaceColor), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) { Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Share, null, tint = Color(0xFF34C759)); Spacer(Modifier.width(16.dp)); Text("Exportă Datele (.csv)", color = textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium) } }
 
@@ -1760,13 +2024,13 @@ fun EcranSetari(
         Spacer(modifier = Modifier.height(32.dp))
         Text("3. NOTIFICĂRI PUSH", color = textSecondary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
         Spacer(modifier = Modifier.height(12.dp))
-        SetareSwitch("Alerte Praf (PM2.5)", "Te notifică când depășește ${prefs.getFloat("alertPm", 35f).toInt()}.", notifPraf, accentColor, textPrimary, textSecondary, surfaceColor, onClick = { showPmDialog = true }) { onNotifPrafChange(it) }
+        SetareSwitch("Alerte Praf (PM2.5)", "Te notifică când depășește ${alertPmState.toInt()} µg/m³.", notifPraf, accentColor, textPrimary, textSecondary, surfaceColor, onClick = { showPmDialog = true }) { onNotifPrafChange(it) }
         Spacer(modifier = Modifier.height(8.dp))
         SetareSwitch("Alertă Aerisire", "Când gazele (CO2/VOC/NOx) depășesc pragurile.", notifGaze, accentColor, textPrimary, textSecondary, surfaceColor, onClick = { showGazeDialog = true }) { onNotifGazeChange(it) }
         Spacer(modifier = Modifier.height(8.dp))
         SetareSwitch("Alertă Deconectare", "Primești notificare când aparatul cade din rețea.", notifOffline, accentColor, textPrimary, textSecondary, surfaceColor) { onNotifOfflineChange(it) }
         Spacer(modifier = Modifier.height(8.dp))
-        SetareSwitch("Rulare în fundal", "Serviciu pentru primirea alertelor cu aplicația închisă.", runInBackground, accentColor, textPrimary, textSecondary, surfaceColor) { onRunInBackgroundChange(it) }
+        SetareSwitch("Alerte în fundal", "Notificări push de la aparat + verificare offline periodică (fără serviciu permanent).", runInBackground, accentColor, textPrimary, textSecondary, surfaceColor) { onRunInBackgroundChange(it) }
         Spacer(modifier = Modifier.height(8.dp))
 
         // Pauză alerte
@@ -1777,7 +2041,7 @@ fun EcranSetari(
                 Text("${notifFreq.roundToInt()} min", color = accentColor, fontSize = 18.sp, fontWeight = FontWeight.Bold)
             }
             Text("Timpul de așteptare între notificări pentru a evita spam-ul.", color = textSecondary, fontSize = 14.sp, modifier = Modifier.padding(top = 4.dp, bottom = 12.dp))
-            SliderInteligentCustom(value = notifFreq, valueRange = 10f..120f, stepSize = 10f, onValueChange = { notifFreq = it }, onValueChangeFinished = { prefs.edit(commit = true) { putInt("notifFreqMins", it.roundToInt()) } }, accentColor = accentColor, textSecondary = textSecondary)
+            SliderInteligentCustom(value = notifFreq, valueRange = 10f..120f, stepSize = 10f, onValueChange = { notifFreq = it }, onValueChangeFinished = { prefs.edit(commit = true) { putInt("notifFreqMins", it.roundToInt()) }; database.child("setari/notif_freq_min").setValue(it.roundToInt()) }, accentColor = accentColor, textSecondary = textSecondary)
         }
         Spacer(modifier = Modifier.height(32.dp))
     }
@@ -1812,7 +2076,7 @@ fun SenzorCard(
     esteArhiva: Boolean, yMaxCap: Float?, faraZecimale: Boolean, textPrimary: Color, textSecondary: Color,
     tipGrafic: Int, chartId: String, globalTouchIndex: Int?, activeChartId: String?,
     onGlobalTouch: (Int?, String?) -> Unit, trendScheme: TrendScheme, trendValue: Int, lastHistoryTimeUnix: Long,
-    douaZecimaleLive: Boolean = false, colorLogic: (Float) -> Color
+    douaZecimaleLive: Boolean = false, esteIndex: Boolean = false, colorLogic: (Float) -> Color
 ) {
     val currentUnix = System.currentTimeMillis() / 1000
     val intervaleLipsa = if (!esteArhiva && lastHistoryTimeUnix > 0) ((currentUnix - lastHistoryTimeUnix) / 300).toInt().coerceAtLeast(0) else 0
@@ -1851,14 +2115,14 @@ fun SenzorCard(
             }
         }
         Spacer(modifier = Modifier.height(2.dp))
-        GraficAvansat(chartId, istoricTaiat, interval, esteArhiva, yMaxCap, faraZecimale, textPrimary, textSecondary, tipGrafic, globalTouchIndex, activeChartId, onGlobalTouch, anchorUnix, colorLogic)
+        GraficAvansat(chartId, istoricTaiat, interval, esteArhiva, yMaxCap, faraZecimale, esteIndex, textPrimary, textSecondary, tipGrafic, globalTouchIndex, activeChartId, onGlobalTouch, anchorUnix, colorLogic)
     }
 }
 
 @Composable
 fun GraficAvansat(
     chartId: String, istoric: List<Float>, interval: IntervalTimp, esteArhiva: Boolean, yMaxCap: Float?,
-    faraZecimale: Boolean, textPrimary: Color, textSecondary: Color, tipGrafic: Int,
+    faraZecimale: Boolean, esteIndex: Boolean, textPrimary: Color, textSecondary: Color, tipGrafic: Int,
     globalTouchIndex: Int?, activeChartId: String?, onGlobalTouch: (Int?, String?) -> Unit,
     anchorUnix: Long, colorLogic: (Float) -> Color
 ) {
@@ -1869,6 +2133,16 @@ fun GraficAvansat(
     var minVal = (istoricValid.minOrNull() ?: 0f) * 0.9f
     if (yMaxCap != null && maxVal > yMaxCap) maxVal = yMaxCap
     if (minVal < 0f) minVal = 0f
+    // Indici SEN66 (VOC/NOx): scalare NATURALA, ca restul graficelor (min*0.9 .. max*1.1).
+    // DOAR in cazul degenerat (valoare ~constanta, ex: NOx mereu 1) span-ul natural e prea mic
+    // si etichetele ar iesi identice ("1 1 1"). Atunci ancoram la valoarea curenta cu un span de 2
+    // -> etichete distincte (ex: 1 / 2 / 3), cu linia jos. Valorile variabile/mari NU se ating.
+    if (esteIndex && (maxVal - minVal) < 2f) {
+        val vConst = istoricValid.minOrNull() ?: minVal
+        minVal = kotlin.math.floor(vConst).coerceAtLeast(0f)
+        maxVal = minVal + 2f
+        if (yMaxCap != null && maxVal > yMaxCap) { maxVal = yMaxCap; minVal = (maxVal - 2f).coerceAtLeast(0f) }
+    }
     val range = if (maxVal == minVal) 1f else maxVal - minVal
     val maxPuncte = interval.puncte
     val offsetStartIndex = maxPuncte - istoric.size
