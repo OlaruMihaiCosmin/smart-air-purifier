@@ -97,14 +97,17 @@ notificări push FCM.
 
 ## Hardware
 
-| Componentă | Rol |
+| Componentă | Detalii |
 |---|---|
-| **ESP32-S3** (PSRAM, flash mare) | Microcontroler principal, WiFi, OTA |
+| **ESP32-S3** (WROOM, PSRAM OPI, flash mare) | Microcontroler principal, WiFi, OTA |
 | **Sensirion SEN66** | Senzor combo: particule (PM1–PM10), CO₂, VOC, NOx, temperatură, umiditate |
-| **Ecran TFT ST7789** | Afișaj local al valorilor în timp real |
+| **Ecran TFT ST7789 2.0"** | Afișaj local al valorilor în timp real |
 | **LED WS2812 (NeoPixel)** | Indicator RGB de stare a calității aerului |
-| **Ventilatoare PWM cu tahometru** | Flux de aer reglabil + citire turație (RPM) |
-| **Cutie Corsi–Rosenthal** | Structura de filtrare (filtre HEPA/MERV + ventilatoare) |
+| **5 × ventilatoare Arctic P14 PWM** | Flux de aer reglabil + citire turație (tahometru) |
+| **4 × filtre IKEA Starkvind** | Mediu de filtrare (eficiență ~99,5% pentru PM2.5) |
+| **Cutie Corsi–Rosenthal** | Structura DIY care leagă filtrele și ventilatoarele |
+
+**Performanță estimată:** CADR ≈ **555 m³/h** la turație maximă — în clasa purificatoarelor comerciale premium.
 
 ---
 
