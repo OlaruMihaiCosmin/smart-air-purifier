@@ -140,8 +140,8 @@ object Paleta {
     val Albastru2   = Color(0xFF007AFF)  // Albastru 2  - accent / default / jurnal / umed-rece
     val Albastru1   = Color(0xFF1E88E5)  // Albastru 1  - gradient temp / umiditate
     val Turcoaz1    = Color(0xFF26A69A)  // Turcoaz 1   - umiditate
-    val Verde3      = Color(0xFF008744)  // Verde 3     - verde accent inchis (scor1 / temp)
-    val Verde1      = Color(0xFF4FA038)  // Verde 1     - verde principal (ui/curat/scor/grafice/trend)
+    val Verde3      = Color(0xFF008744)  // Verde 3     - verde accent inchis (scor1 / temp / grafice)
+    val Verde1      = Color(0xFF4FA038)  // Verde 1     - verde principal (ui/curat/scor/trend)
     val Verde2      = Color(0xFF8CB342)  // Verde 2     - verde deschis (umiditate)
     val Galben1     = Color(0xFFFDD835)  // Galben 1
     val Portocaliu1 = Color(0xFFFF9500)  // Portocaliu 1
@@ -242,7 +242,7 @@ fun getHumidColor(v: Float): Color {
 // dar cu praguri (ancorele = valoare -> culoare) potrivite scarii fiecaruia.
 // Ca sa ADAUGI mai multe ancore: pune inca o pereche "valoare to culoare" in lista
 // poluantului respectiv (ex: 18f to galbenAer). Se interpoleaza automat intre ele.
-private val verdeAer      = Paleta.Verde1       // curat
+private val verdeAer      = Paleta.Verde3       // curat
 private val galbenAer     = Paleta.Galben1      // moderat
 private val portocaliuAer = Paleta.Portocaliu1  // ridicat
 private val rosuAer       = Paleta.Rosu1        // periculos
@@ -256,9 +256,9 @@ private val ancorePm1  = listOf(0f to verdeAer,   5f to galbenAer,   15f to port
 private val ancorePm25 = listOf(0f to verdeAer,  10f to galbenAer,   25f to portocaliuAer,   35f to rosuAer)
 private val ancorePm4  = listOf(0f to verdeAer,  15f to galbenAer,   35f to portocaliuAer,   50f to rosuAer)
 private val ancorePm10 = listOf(0f to verdeAer,  30f to galbenAer,   70f to portocaliuAer,  100f to rosuAer)
-private val ancoreCo2  = listOf(400f to verdeAer, 1000f to galbenAer, 1400f to portocaliuAer, 1600f to rosuAer)
-private val ancoreVoc  = listOf(0f to verdeAer, 150f to galbenAer,  300f to portocaliuAer,  400f to rosuAer)
-private val ancoreNox  = listOf(0f to verdeAer,  75f to galbenAer,  200f to portocaliuAer,  300f to rosuAer)
+private val ancoreCo2  = listOf(450f to verdeAer, 1000f to galbenAer, 1500f to portocaliuAer, 2000f to rosuAer)
+private val ancoreVoc  = listOf(100f to verdeAer, 200f to galbenAer,  325f to portocaliuAer,  450f to rosuAer)
+private val ancoreNox  = listOf(0f to verdeAer,  85f to galbenAer,  225f to portocaliuAer,  400f to rosuAer)
 
 fun getPm1Color(v: Float): Color  = gradientPoluant(v, ancorePm1)
 fun getPm25Color(v: Float): Color = gradientPoluant(v, ancorePm25)
@@ -1456,18 +1456,27 @@ fun EcranArhiva(
     var paginaSaptamani by remember { mutableIntStateOf(0) }   // 0 = cele mai recente 4 saptamani
     val formatter = DateTimeFormatter.ofPattern("yyyy_MM_dd")
 
-    // Fereastra implicita = EXACT cele 4 saptamani afisate (luni a saptamanii -3 -> azi), nu
-    // "ultimele 28 de zile": 28 de zile ar prinde si 1-2 zile dintr-a 5-a saptamana calendaristica
-    // (descarcand mai mult si facand pagina -1 sa para deja in memorie).
-    val luniCurenta = remember { LocalDate.now().with(DayOfWeek.MONDAY) }
-    val startKey = remember(luniCurenta) { luniCurenta.minusWeeks(3).format(formatter) }
-    val endKeyVechi = remember(luniCurenta) { luniCurenta.minusWeeks(3).minusDays(1).format(formatter) }
+    // Fereastra implicita = EXACT 4 saptamani complete, nu "ultimele 28 de zile" (care ar prinde
+    // 1-2 zile dintr-a 5-a saptamana calendaristica). ANCORA = luni a celei mai recente saptamani
+    // CU DATE, NU saptamana calendaristica curenta: altfel, la inceput de saptamana noua (inainte
+    // sa existe vreo zi scrisa pentru saptamana curenta), cea mai veche dintre cele 4 saptamani
+    // complete ar cadea exact in afara ferestrei (startAt o exclude) si ar lipsi — bug "off by one".
+    var luniReferinta by remember { mutableStateOf(LocalDate.now().with(DayOfWeek.MONDAY)) }
+    LaunchedEffect(Unit) {
+        database.child("Arhiva_Zilnica").orderByKey().limitToLast(1).get().addOnSuccessListener { snap ->
+            snap.children.lastOrNull()?.key
+                ?.let { runCatching { LocalDate.parse(it, formatter) }.getOrNull() }
+                ?.let { luniReferinta = it.with(DayOfWeek.MONDAY) }
+        }
+    }
+    val startKey = remember(luniReferinta) { luniReferinta.minusWeeks(3).format(formatter) }
+    val endKeyVechi = remember(luniReferinta) { luniReferinta.minusWeeks(3).minusDays(1).format(formatter) }
 
     var globalTouchIndex by remember { mutableStateOf<Int?>(null) }
     var activeChartId by remember { mutableStateOf<String?>(null) }
     val onGlobalTouch: (Int?, String?) -> Unit = { idx, id -> globalTouchIndex = idx; activeChartId = id }
 
-    DisposableEffect(Unit) {
+    DisposableEffect(startKey) {
         val listener = object : ValueEventListener {
             override fun onDataChange(snapshot: DataSnapshot) {
                 val mapNou = mutableMapOf<String, Map<String, List<Float>>>()
@@ -2082,17 +2091,26 @@ fun EcranSetari(
         Button(onClick = { showCleanDialog = true }, colors = ButtonDefaults.buttonColors(containerColor = surfaceColor), shape = RoundedCornerShape(12.dp), border = if (surfaceColor == Color.White) BorderStroke(1.dp, Paleta.Alb3) else null, modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) { Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Settings, null, tint = Paleta.Albastru1); Spacer(Modifier.width(16.dp)); Text("Curățare Senzor SEN66", color = textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium) } }
         Button(onClick = { showExportDialog = true }, colors = ButtonDefaults.buttonColors(containerColor = surfaceColor), shape = RoundedCornerShape(12.dp), border = if (surfaceColor == Color.White) BorderStroke(1.dp, Paleta.Alb3) else null, modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) { Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Share, null, tint = Paleta.Verde1); Spacer(Modifier.width(16.dp)); Text("Exportă Datele (.csv)", color = textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium) } }
 
-        // Offset temperatură
+        // Offset temperatură (ascuns implicit — apare la tap pe card, ca să nu fie modificat accidental la scroll)
         var localOffset by remember { mutableFloatStateOf(tempOffsetServer) }
         var isOffsetDragging by remember { mutableStateOf(false) }
+        var offsetExtins by remember { mutableStateOf(false) }
+        val offsetRotatie by animateFloatAsState(if (offsetExtins) 180f else 0f, label = "offsetChevron")
         LaunchedEffect(tempOffsetServer) { if (!isOffsetDragging) localOffset = tempOffsetServer }
         Column(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(surfaceColor).border(1.dp, if (surfaceColor == Color.White) Paleta.Alb3 else Color.Transparent, RoundedCornerShape(12.dp)).padding(16.dp)) {
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Row(modifier = Modifier.fillMaxWidth().clickable { offsetExtins = !offsetExtins }, horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 Text("Offset Temperatură", color = textPrimary, fontSize = 18.sp, fontWeight = FontWeight.Medium)
-                Text("${if (localOffset > 0) "+" else ""}${"%.1f".format(localOffset)} °C", color = accentColor, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("${if (localOffset > 0) "+" else ""}${"%.1f".format(localOffset)} °C", color = accentColor, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                    Icon(Icons.Default.KeyboardArrowDown, contentDescription = "Extinde", tint = textSecondary, modifier = Modifier.padding(start = 4.dp).rotate(offsetRotatie))
+                }
             }
-            Text("Compensează căldura radiată de ventilator pentru o citire perfectă.", color = textSecondary, fontSize = 14.sp, modifier = Modifier.padding(top = 4.dp, bottom = 12.dp))
-            SliderInteligentCustom(value = localOffset, valueRange = -3f..3f, stepSize = 0.1f, onValueChange = { isOffsetDragging = true; localOffset = it }, onValueChangeFinished = { isOffsetDragging = false; onTempOffsetChange(it) }, onDragStateChange = { isOffsetDragging = it }, accentColor = accentColor, textSecondary = textSecondary)
+            AnimatedVisibility(visible = offsetExtins) {
+                Column {
+                    Text("Compensează căldura radiată de ventilator pentru o citire perfectă.", color = textSecondary, fontSize = 14.sp, modifier = Modifier.padding(top = 8.dp, bottom = 12.dp))
+                    SliderInteligentCustom(value = localOffset, valueRange = -3f..3f, stepSize = 0.1f, onValueChange = { isOffsetDragging = true; localOffset = it }, onValueChangeFinished = { isOffsetDragging = false; onTempOffsetChange(it) }, onDragStateChange = { isOffsetDragging = it }, accentColor = accentColor, textSecondary = textSecondary)
+                }
+            }
         }
 
         Spacer(modifier = Modifier.height(32.dp))
@@ -2107,15 +2125,24 @@ fun EcranSetari(
         SetareSwitch("Alerte în fundal", "Notificări push de la aparat + verificare offline periodică (fără serviciu permanent).", runInBackground, accentColor, textPrimary, textSecondary, surfaceColor) { onRunInBackgroundChange(it) }
         Spacer(modifier = Modifier.height(8.dp))
 
-        // Pauză alerte
+        // Pauză alerte (ascuns implicit — apare la tap pe card)
         Column(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(surfaceColor).border(1.dp, if (surfaceColor == Color.White) Paleta.Alb3 else Color.Transparent, RoundedCornerShape(12.dp)).padding(16.dp)) {
             var notifFreq by remember { mutableFloatStateOf(((prefs.getInt("notifFreqMins", 10) / 10f).roundToInt() * 10).toFloat().coerceIn(10f, 120f)) }
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            var pauzaExtins by remember { mutableStateOf(false) }
+            val pauzaRotatie by animateFloatAsState(if (pauzaExtins) 180f else 0f, label = "pauzaChevron")
+            Row(modifier = Modifier.fillMaxWidth().clickable { pauzaExtins = !pauzaExtins }, horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 Text("Pauză Alerte", color = textPrimary, fontSize = 18.sp, fontWeight = FontWeight.Medium)
-                Text("${notifFreq.roundToInt()} min", color = accentColor, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("${notifFreq.roundToInt()} min", color = accentColor, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                    Icon(Icons.Default.KeyboardArrowDown, contentDescription = "Extinde", tint = textSecondary, modifier = Modifier.padding(start = 4.dp).rotate(pauzaRotatie))
+                }
             }
-            Text("Timpul de așteptare între notificări pentru a evita spam-ul.", color = textSecondary, fontSize = 14.sp, modifier = Modifier.padding(top = 4.dp, bottom = 12.dp))
-            SliderInteligentCustom(value = notifFreq, valueRange = 10f..120f, stepSize = 10f, onValueChange = { notifFreq = it }, onValueChangeFinished = { prefs.edit(commit = true) { putInt("notifFreqMins", it.roundToInt()) }; database.child("setari/notif_freq_min").setValue(it.roundToInt()) }, accentColor = accentColor, textSecondary = textSecondary)
+            AnimatedVisibility(visible = pauzaExtins) {
+                Column {
+                    Text("Timpul de așteptare între notificări pentru a evita spam-ul.", color = textSecondary, fontSize = 14.sp, modifier = Modifier.padding(top = 8.dp, bottom = 12.dp))
+                    SliderInteligentCustom(value = notifFreq, valueRange = 10f..120f, stepSize = 10f, onValueChange = { notifFreq = it }, onValueChangeFinished = { prefs.edit(commit = true) { putInt("notifFreqMins", it.roundToInt()) }; database.child("setari/notif_freq_min").setValue(it.roundToInt()) }, accentColor = accentColor, textSecondary = textSecondary)
+                }
+            }
         }
         Spacer(modifier = Modifier.height(32.dp))
     }
@@ -2301,9 +2328,18 @@ fun GraficAvansat(
                 val x2 = (offsetStartIndex + i + 1) * distantaX; val y2 = h - ((val2 - minVal) / range) * h
                 if (fillPath == null) { fillPath = Path().apply { moveTo(x1, y1) }; startX = x1 }
                 if (tipGrafic == 1) {
-                    val cx = (x1 + x2) / 2f
-                    fillPath.cubicTo(cx, y1, cx, y2, x2, y2)
-                    drawPath(Path().apply { moveTo(x1, y1); cubicTo(cx, y1, cx, y2, x2, y2) }, color = colorLogic(val2), style = Stroke(6f, cap = StrokeCap.Round))
+                    // Spline Catmull-Rom: tangenta in fiecare punct tine cont de punctele vecine,
+                    // deci curba curge lin prin puncte (fara forma de "∫" data de tangentele orizontale).
+                    val arePrev = i - 1 >= 0 && istoric[i - 1] != -999f
+                    val x0 = if (arePrev) (offsetStartIndex + i - 1) * distantaX else x1
+                    val y0 = if (arePrev) h - ((istoric[i - 1] - minVal) / range) * h else y1
+                    val areNext = i + 2 < istoric.size && istoric[i + 2] != -999f
+                    val x3 = if (areNext) (offsetStartIndex + i + 2) * distantaX else x2
+                    val y3 = if (areNext) h - ((istoric[i + 2] - minVal) / range) * h else y2
+                    val c1x = x1 + (x2 - x0) / 6f; val c1y = y1 + (y2 - y0) / 6f
+                    val c2x = x2 - (x3 - x1) / 6f; val c2y = y2 - (y3 - y1) / 6f
+                    fillPath.cubicTo(c1x, c1y, c2x, c2y, x2, y2)
+                    drawPath(Path().apply { moveTo(x1, y1); cubicTo(c1x, c1y, c2x, c2y, x2, y2) }, color = colorLogic(val2), style = Stroke(6f, cap = StrokeCap.Round))
                 } else {
                     fillPath.lineTo(x2, y1); fillPath.lineTo(x2, y2)
                     drawPath(Path().apply { moveTo(x1, y1); lineTo(x2, y1); lineTo(x2, y2) }, color = colorLogic(val2), style = Stroke(6f, cap = StrokeCap.Round))
