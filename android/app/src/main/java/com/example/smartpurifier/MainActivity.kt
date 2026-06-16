@@ -69,6 +69,7 @@ import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
@@ -117,12 +118,53 @@ import kotlin.math.roundToInt
 
 // ================= ENUMERĂRI ȘI VARIABILE GLOBALE =================
 enum class IntervalTimp(val ore: Int, val puncte: Int) { ORE_4(4, 48), ORE_12(12, 144), ORE_24(24, 288) }
+// ================= PALETA DE CULORI (sursa unica pentru toata aplicatia) =================
+// Modifici o culoare AICI -> se schimba peste tot (grafice, gradiente, widget, tema, jurnal,
+// scoruri, trenduri). Fundalurile (gri / negru / alb) sunt pastrate ca atare, doar adunate aici.
+// Numele urmeaza paleta "Culori noi"; pentru a schimba o nuanta, editezi un singur rand.
+object Paleta {
+    // --- Fundaluri: gri / negru / alb (neschimbate) ---
+    val Alb1   = Color(0xFFF2F2F7)
+    val Alb2   = Color(0xFFE5E5EA)
+    val Alb3   = Color(0xFFD1D1D6)
+    val Gri1   = Color(0xFF8E8E93)
+    val Gri2   = Color(0xFF3A3A3C)
+    val Gri3   = Color(0xFF2C2C2E)
+    val Gri4   = Color(0xFF1C1C1E)
+    val Negru1 = Color(0xFF121212)
+    val Negru2 = Color(0xFF000000)
+
+    // --- Culori (paleta unificata) ---
+    val Mov1        = Color(0xFF884AD2)  // Mov 1       - accent / jurnal / temp
+    val Albastru3   = Color(0xFF0D47A1)  // Albastru 3  - umiditate ridicata
+    val Albastru2   = Color(0xFF007AFF)  // Albastru 2  - accent / default / jurnal / umed-rece
+    val Albastru1   = Color(0xFF1E88E5)  // Albastru 1  - gradient temp / umiditate
+    val Turcoaz1    = Color(0xFF26A69A)  // Turcoaz 1   - umiditate
+    val Verde3      = Color(0xFF008744)  // Verde 3     - verde accent inchis (scor1 / temp)
+    val Verde1      = Color(0xFF4FA038)  // Verde 1     - verde principal (ui/curat/scor/grafice/trend)
+    val Verde2      = Color(0xFF8CB342)  // Verde 2     - verde deschis (umiditate)
+    val Galben1     = Color(0xFFFDD835)  // Galben 1
+    val Portocaliu1 = Color(0xFFFF9500)  // Portocaliu 1
+    val Maro1       = Color(0xFFBF764E)  // Maro 1      - umiditate uscata
+    val Rosu1       = Color(0xFFD0281F)  // Rosu 1
+    val Roz1        = Color(0xFFE84393)  // Roz 1 (roz viu, armonizat cu restul accentelor)
+
+    // --- Culori Widget
+    val GriWidget        = Color(0xFF45484D)  // inelul de fundal de pe cadranul widget
+    val GriText          = Color(0xFF6E6E73)  // text secundar / fara-date
+    val VerdeWidget      = Color(0xFF00C76D)  // Verde
+    val GalbenWidget     = Color(0xFFFFF700)  // Galben
+    val PortocaliuWidget = Color(0xFFFF9600)  // Portocaliu
+    val RosuWidget       = Color(0xFFD45C61)  // Rosu
+}
+
 val culoriDisponibile = listOf(
-    0xFF367AFF.toInt() to "Albastru",
-    0xFFA53DDA.toInt() to "Mov",
-    0xFFD62D20.toInt() to "Roșu",
-    0xFFF09000.toInt() to "Portocaliu",
-    0xFF008744.toInt() to "Verde",
+    Paleta.Rosu1.toArgb() to "Roșu",
+    Paleta.Roz1.toArgb() to "Roz",
+    Paleta.Mov1.toArgb() to "Mov",
+    Paleta.Albastru2.toArgb() to "Albastru",
+    Paleta.Turcoaz1.toArgb() to "Turcoaz",
+    Paleta.Verde3.toArgb() to "Verde",
 )
 enum class TrendScheme { POLLUTANTS, TEMPERATURE, HUMIDITY }
 
@@ -165,13 +207,13 @@ private fun gradientPeAncore(v: Float, ancore: List<Pair<Float, Color>>): Color 
 // sub 16 mov arctic, 16-18 albastru, 18-22 verde (ideal), 22-24 galben,
 // 24-26 portocaliu, 26-30 rosu, 30+ rosu intens — cu gradient intre benzi.
 private val ancoreTemperatura = listOf(
-    16f to Color(0xFF6559C8),   // mov arctic (frig sever)
-    18f to Color(0xFF1E88E5),   // albastru (racoare)
-    21f to Color(0xFF43A047),   // verde (confort ideal)
-    23f to Color(0xFFFDD835),   // galben (caldut)
-    25f to Color(0xFFFB8C00),   // portocaliu (cald)
-    27f to Color(0xFFE53935),   // rosu (prea cald)
-    29f to Color(0xFFB71C1C)    // rosu intens (canicula)
+    16f to Paleta.Mov1,        // mov arctic (frig sever)
+    18f to Paleta.Albastru2,   // albastru (racoare)
+    20f to Paleta.Verde3,      // verde inchis (ideal racoros)
+    21f to Paleta.Verde1,      // verde (confort)
+    23f to Paleta.Galben1,     // galben (caldut)
+    25f to Paleta.Portocaliu1, // portocaliu (cald)
+    27f to Paleta.Rosu1        // rosu (prea cald)
 )
 
 fun getTempColor(v: Float): Color {
@@ -182,18 +224,49 @@ fun getTempColor(v: Float): Color {
 // Umiditatea, in stilul barei meteo (maro uscat -> verde -> turcoaz -> albastru inchis),
 // centrata pe intervalul ideal dintr-un apartament (40-60% = verde).
 private val ancoreUmiditate = listOf(
-    30f to Color(0xFFB1764E),   // maro (aer foarte uscat)
-    40f to Color(0xFF7CB342),   // verde deschis (acceptabil spre uscat)
-    50f to Color(0xFF43A047),   // verde (ideal 40-60%)
-    60f to Color(0xFF26A69A),   // turcoaz (usor umed)
-    70f to Color(0xFF1E88E5),   // albastru (umed)
-    80f to Color(0xFF0D47A1)    // albastru inchis (excesiv)
+    30f to Paleta.Maro1,      // maro (aer foarte uscat)
+    40f to Paleta.Verde2,     // verde deschis (acceptabil spre uscat)
+    50f to Paleta.Verde1,     // verde (ideal 40-60%)
+    60f to Paleta.Turcoaz1,   // turcoaz (usor umed)
+    70f to Paleta.Albastru1,  // albastru (umed)
+    80f to Paleta.Albastru3   // albastru inchis (excesiv)
 )
 
 fun getHumidColor(v: Float): Color {
     if (v == -999f) return Color.Transparent
     return gradientPeAncore(v, ancoreUmiditate)
 }
+
+// ================= GRADIENT POLUANTI (PM / CO2 / VOC / NOx) =================
+// Aceeasi paleta de 4 culori pentru toti poluantii (verde curat -> rosu periculos),
+// dar cu praguri (ancorele = valoare -> culoare) potrivite scarii fiecaruia.
+// Ca sa ADAUGI mai multe ancore: pune inca o pereche "valoare to culoare" in lista
+// poluantului respectiv (ex: 18f to galbenAer). Se interpoleaza automat intre ele.
+private val verdeAer      = Paleta.Verde1       // curat
+private val galbenAer     = Paleta.Galben1      // moderat
+private val portocaliuAer = Paleta.Portocaliu1  // ridicat
+private val rosuAer       = Paleta.Rosu1        // periculos
+
+private fun gradientPoluant(v: Float, ancore: List<Pair<Float, Color>>): Color {
+    if (v == -999f) return Color.Transparent
+    return gradientPeAncore(v, ancore)
+}
+
+private val ancorePm1  = listOf(0f to verdeAer,   5f to galbenAer,   15f to portocaliuAer,   25f to rosuAer)
+private val ancorePm25 = listOf(0f to verdeAer,  10f to galbenAer,   25f to portocaliuAer,   35f to rosuAer)
+private val ancorePm4  = listOf(0f to verdeAer,  15f to galbenAer,   35f to portocaliuAer,   50f to rosuAer)
+private val ancorePm10 = listOf(0f to verdeAer,  30f to galbenAer,   70f to portocaliuAer,  100f to rosuAer)
+private val ancoreCo2  = listOf(400f to verdeAer, 1000f to galbenAer, 1400f to portocaliuAer, 1600f to rosuAer)
+private val ancoreVoc  = listOf(0f to verdeAer, 150f to galbenAer,  300f to portocaliuAer,  400f to rosuAer)
+private val ancoreNox  = listOf(0f to verdeAer,  75f to galbenAer,  200f to portocaliuAer,  300f to rosuAer)
+
+fun getPm1Color(v: Float): Color  = gradientPoluant(v, ancorePm1)
+fun getPm25Color(v: Float): Color = gradientPoluant(v, ancorePm25)
+fun getPm4Color(v: Float): Color  = gradientPoluant(v, ancorePm4)
+fun getPm10Color(v: Float): Color = gradientPoluant(v, ancorePm10)
+fun getCo2Color(v: Float): Color  = gradientPoluant(v, ancoreCo2)
+fun getVocColor(v: Float): Color  = gradientPoluant(v, ancoreVoc)
+fun getNoxColor(v: Float): Color  = gradientPoluant(v, ancoreNox)
 
 fun ascultaFirebase(db: DatabaseReference, child: String, type: Class<out Any>, onChange: (Any?) -> Unit): ValueEventListener {
     val listener = object : ValueEventListener {
@@ -299,11 +372,11 @@ fun SliderInteligentCustom(
             if (pctCurent > 0f) drawLine(color = activeTrackColor, start = Offset(thumbRadiusPx, yCenter), end = Offset(activeEndX, yCenter), strokeWidth = trackHeightPx, cap = StrokeCap.Round)
             if (hasHoverStopZone) {
                 val stopPctEnd = ((stopZoneRange.endInclusive - valueRange.start) / (valueRange.endInclusive - valueRange.start)).coerceIn(0f, 1f)
-                drawLine(color = Color(0xFF6E6E73), start = Offset(thumbRadiusPx, yCenter), end = Offset(thumbRadiusPx + stopPctEnd * trackWidth, yCenter), strokeWidth = trackHeightPx, cap = StrokeCap.Round)
+                drawLine(color = Paleta.GriText, start = Offset(thumbRadiusPx, yCenter), end = Offset(thumbRadiusPx + stopPctEnd * trackWidth, yCenter), strokeWidth = trackHeightPx, cap = StrokeCap.Round)
             }
             drawCircle(color = Color.Black.copy(alpha = 0.1f), radius = thumbRadiusPx + 3f, center = Offset(activeEndX, yCenter + 4f))
             drawCircle(color = Color.White, radius = thumbRadiusPx, center = Offset(activeEndX, yCenter))
-            drawCircle(color = Color(0xFFE5E5EA), radius = thumbRadiusPx, center = Offset(activeEndX, yCenter), style = Stroke(width = 2f))
+            drawCircle(color = Paleta.Alb2, radius = thumbRadiusPx, center = Offset(activeEndX, yCenter), style = Stroke(width = 2f))
         }
     }
 }
@@ -338,7 +411,7 @@ private fun creeazaCadranWidget(value: Float, max: Float, label: String, valStri
     paint.style = android.graphics.Paint.Style.STROKE
     paint.strokeWidth = strokeW
     paint.strokeCap = android.graphics.Paint.Cap.ROUND
-    paint.color = 0xFF45484D.toInt()
+    paint.color = Paleta.GriWidget.toArgb()
     canvas.drawArc(rect, arcStart, arcSweep, false, paint)
 
     // Arc colorat (progresul)
@@ -372,7 +445,7 @@ private fun creeazaCadranWidget(value: Float, max: Float, label: String, valStri
 
     // Indicator de vechime: cand cache-ul e vechi, varsta datelor apare in inel, sub eticheta
     if (etichetaVechime != null) {
-        paint.color = 0xFF8E8E93.toInt()
+        paint.color = Paleta.Gri1.toArgb()
         paint.textSize = 28f
         paint.typeface = android.graphics.Typeface.create("sans-serif", android.graphics.Typeface.NORMAL)
         canvas.drawText(etichetaVechime, cx, arcCy + 52f, paint)
@@ -407,11 +480,11 @@ private fun randeazaWidget(context: Context, pm25: Float, co2: Int, varstaMinute
         else -> "acum ${varstaMinute / 1440}z"
     }
 
-    val grayNoData = 0xFF6E6E73.toInt()
+    val grayNoData = Paleta.GriText.toArgb()
     val arePm = pm25 >= 0f
     val areCo2 = co2 >= 0
-    val pmColor  = if (!arePm || esteVechi)  grayNoData else when { pm25 < 5 -> 0xFF00E174.toInt(); pm25 < 12 -> 0xFFFFEB3B.toInt(); pm25 < 35 -> 0xFFFF9800.toInt(); else -> 0xFFF44336.toInt() }
-    val co2Color = if (!areCo2 || esteVechi) grayNoData else when { co2 < 800 -> 0xFF00E174.toInt(); co2 < 1200 -> 0xFFFFEB3B.toInt(); co2 < 1600 -> 0xFFFF9800.toInt(); else -> 0xFFF44336.toInt() }
+    val pmColor  = if (!arePm || esteVechi)  grayNoData else when { pm25 < 5 -> Paleta.VerdeWidget.toArgb(); pm25 < 12 -> Paleta.GalbenWidget.toArgb(); pm25 < 35 -> Paleta.PortocaliuWidget.toArgb(); else -> Paleta.RosuWidget.toArgb() }
+    val co2Color = if (!areCo2 || esteVechi) grayNoData else when { co2 < 800 -> Paleta.VerdeWidget.toArgb(); co2 < 1200 -> Paleta.GalbenWidget.toArgb(); co2 < 1600 -> Paleta.PortocaliuWidget.toArgb(); else -> Paleta.RosuWidget.toArgb() }
 
     // Sub 10 µg/m³ zecimala conteaza (5 vs 9 e o diferenta mare de calitate) — o afisam;
     // peste 10, valoarea intreaga e suficienta si tine cadranul aerisit.
@@ -617,7 +690,7 @@ class MainActivity : ComponentActivity() {
                     Box(modifier = Modifier.fillMaxSize().background(Color.White), contentAlignment = Alignment.Center) {
                         Text(
                             "Configurație lipsă!\n\nCopiază secrete.properties.example ca secrete.properties, completează smartair.dbUrl / smartair.fbEmail / smartair.fbPass și refă build-ul.",
-                            color = Color.Red, textAlign = TextAlign.Center, fontWeight = FontWeight.Bold,
+                            color = Paleta.Rosu1, textAlign = TextAlign.Center, fontWeight = FontWeight.Bold,
                             modifier = Modifier.padding(24.dp)
                         )
                     }
@@ -641,7 +714,7 @@ class MainActivity : ComponentActivity() {
                                 Box(modifier = Modifier.fillMaxSize().background(Color.White), contentAlignment = Alignment.Center) {
                                     Text(
                                         "Eroare Firebase:\n\n$mesajEroare\n\nVerifică datele din secrete.properties și contul din consola Firebase!",
-                                        color = Color.Red, textAlign = TextAlign.Center, fontWeight = FontWeight.Bold,
+                                        color = Paleta.Rosu1, textAlign = TextAlign.Center, fontWeight = FontWeight.Bold,
                                         modifier = Modifier.padding(24.dp)
                                     )
                                 }
@@ -681,16 +754,16 @@ fun PurificatorAppMain() {
     val liveModeJob = remember { mutableStateOf<Job?>(null) }
 
     var isDarkMode by remember { mutableStateOf(prefs.getBoolean("isDarkMode", true)) }
-    var accentColor by remember { mutableStateOf(Color(prefs.getInt("themeColor", 0xFF367AFF.toInt()))) }
+    var accentColor by remember { mutableStateOf(Color(prefs.getInt("themeColor", Paleta.Albastru2.toArgb()))) }
     var tipGrafic by remember { mutableIntStateOf(prefs.getInt("tipGrafic", 0)) }
     var runInBackground by remember { mutableStateOf(prefs.getBoolean("runInBackground", true)) }
     var categoryOrder by remember { mutableStateOf((prefs.getString("catOrder", "0,1,2") ?: "0,1,2").split(",").mapNotNull { it.toIntOrNull() }) }
 
-    val bgMain = if (isDarkMode) Color(0xFF000000) else Color(0xFFF2F2F7)
-    val surfaceColor = if (isDarkMode) Color(0xFF1C1C1E) else Color.White
+    val bgMain = if (isDarkMode) Paleta.Negru2 else Paleta.Alb1
+    val surfaceColor = if (isDarkMode) Paleta.Gri4 else Color.White
     val textPrimary = if (isDarkMode) Color.White else Color.Black
     val textSecondary = if (isDarkMode) Color.Gray else Color.DarkGray
-    val dividerColor = if (isDarkMode) Color.DarkGray else Color(0xFFD1D1D6)
+    val dividerColor = if (isDarkMode) Color.DarkGray else Paleta.Alb3
 
     var tabSelectat by remember { mutableIntStateOf(0) }
     var intervalSelectat by remember { mutableStateOf(IntervalTimp.ORE_12) }
@@ -854,17 +927,17 @@ fun PurificatorAppMain() {
                 NavigationBarItem(
                     icon = { Icon(Icons.Default.Home, null) }, selected = tabSelectat == 0,
                     onClick = { tabSelectat = 0 },
-                    colors = NavigationBarItemDefaults.colors(selectedIconColor = accentColor, unselectedIconColor = textSecondary, indicatorColor = if (isDarkMode) Color(0xFF2C2C2E) else Color(0xFFE5E5EA))
+                    colors = NavigationBarItemDefaults.colors(selectedIconColor = accentColor, unselectedIconColor = textSecondary, indicatorColor = if (isDarkMode) Paleta.Gri3 else Paleta.Alb2)
                 )
                 NavigationBarItem(
                     icon = { Icon(Icons.Default.DateRange, null) }, selected = tabSelectat == 1,
                     onClick = { tabSelectat = 1 },
-                    colors = NavigationBarItemDefaults.colors(selectedIconColor = accentColor, unselectedIconColor = textSecondary, indicatorColor = if (isDarkMode) Color(0xFF2C2C2E) else Color(0xFFE5E5EA))
+                    colors = NavigationBarItemDefaults.colors(selectedIconColor = accentColor, unselectedIconColor = textSecondary, indicatorColor = if (isDarkMode) Paleta.Gri3 else Paleta.Alb2)
                 )
                 NavigationBarItem(
                     icon = { Icon(Icons.Default.Settings, null) }, selected = tabSelectat == 2,
                     onClick = { tabSelectat = 2 },
-                    colors = NavigationBarItemDefaults.colors(selectedIconColor = accentColor, unselectedIconColor = textSecondary, indicatorColor = if (isDarkMode) Color(0xFF2C2C2E) else Color(0xFFE5E5EA))
+                    colors = NavigationBarItemDefaults.colors(selectedIconColor = accentColor, unselectedIconColor = textSecondary, indicatorColor = if (isDarkMode) Paleta.Gri3 else Paleta.Alb2)
                 )
             }
         }
@@ -1038,11 +1111,11 @@ fun CardScorZilnic(
     val areScor = scorFinal >= 0
     val colorScor = when {
         !areScor -> textSecondary
-        scorFinal >= 90 -> Color(0xFF4CAF50)   // Verde
-        scorFinal >= 75 -> Color(0xFF8BC34A)   // Verde-gălbui
-        scorFinal >= 60 -> Color(0xFFFFF700)   // Galben
-        scorFinal >= 40 -> Color(0xFFFF9800)   // Portocaliu
-        else -> Color(0xFFF44336)              // Roșu
+        scorFinal >= 90 -> Paleta.Verde3   // Verde
+        scorFinal >= 75 -> Paleta.Verde1   // Verde-gălbui
+        scorFinal >= 60 -> Paleta.Galben1   // Galben
+        scorFinal >= 40 -> Paleta.Portocaliu1   // Portocaliu
+        else -> Paleta.Rosu1              // Roșu
     }
     val mesaj = when {
         !areScor -> "Se colectează date..."
@@ -1054,7 +1127,7 @@ fun CardScorZilnic(
     }
 
     Row(
-        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(surfaceColor).padding(16.dp),
+        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(surfaceColor).border(1.dp, if (surfaceColor == Color.White) Paleta.Alb3 else Color.Transparent, RoundedCornerShape(16.dp)).padding(16.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Box(contentAlignment = Alignment.Center, modifier = Modifier.size(60.dp)) {
@@ -1129,6 +1202,7 @@ fun DraggableCategoryGroup(
                                 .fillMaxWidth()
                                 .clip(RoundedCornerShape(8.dp))
                                 .background(surfaceColor)
+                                .border(1.dp, if (surfaceColor == Color.White) Paleta.Alb3 else Color.Transparent, RoundedCornerShape(8.dp))
                                 .pointerInput(catId, index) {
                                     detectDragGesturesAfterLongPress(
                                         onDragStart = {
@@ -1257,8 +1331,8 @@ fun EcranAcasa(
             val statusColor = when {
                 !initLoadDone -> textSecondary
                 diferentaSecunde < 30 -> textSecondary
-                diferentaSecunde < 60 -> Color(0xFFFF9800)
-                else -> Color.Red
+                diferentaSecunde < 60 -> Paleta.Portocaliu1
+                else -> Paleta.Rosu1
             }
             Text(statusText, color = statusColor, fontSize = 12.sp)
         }
@@ -1278,7 +1352,7 @@ fun EcranAcasa(
         ) {
             Text(
                 text = "Putere: ${if (isOprit) "OPRIT" else "${displaySliderValue.roundToInt()}%"}",
-                color = if (isOprit) Color.Red.copy(alpha = 0.8f) else textPrimary,
+                color = if (isOprit) Paleta.Rosu1.copy(alpha = 0.8f) else textPrimary,
                 fontSize = 16.sp, modifier = Modifier.weight(1f), textAlign = TextAlign.Start
             )
             Button(
@@ -1326,15 +1400,15 @@ fun EcranAcasa(
             prefs = prefs, surfaceColor = surfaceColor, textSecondary = textSecondary,
             categoryOrder = categoryOrder, onOrderChange = onOrderChange,
             contentPraf = {
-                SenzorCard("PM 1.0", animPm1, false, istoricPM1, intervalSelectat, false, null, false, textPrimary, textSecondary, tipGrafic, "PM1", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, trendPm1, lastHistoryTimeUnix) { v -> if (v == -999f) Color.Transparent else if (v < 3) Color(0XFF40CE19) else if (v < 8) Color(0xFFFAF250) else if (v < 25) Color(0xFFF5961A) else Color(0xFFE21E1E) }
-                SenzorCard("PM 2.5", animPm25, false, istoricPM25, intervalSelectat, false, null, false, textPrimary, textSecondary, tipGrafic, "PM25", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, trendPm25, lastHistoryTimeUnix) { v -> if (v == -999f) Color.Transparent else if (v < 5) Color(0XFF40CE19) else if (v < 12) Color(0xFFFAF250) else if (v < 35) Color(0xFFF5961A) else Color(0xFFE21E1E) }
-                SenzorCard("PM 4.0", animPm4, false, istoricPM4, intervalSelectat, false, null, false, textPrimary, textSecondary, tipGrafic, "PM4", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, trendPm4, lastHistoryTimeUnix) { v -> if (v == -999f) Color.Transparent else if (v < 10) Color(0XFF40CE19) else if (v < 25) Color(0xFFFAF250) else if (v < 50) Color(0xFFF5961A) else Color(0xFFE21E1E) }
-                SenzorCard("PM 10", animPm10, false, istoricPM10, intervalSelectat, false, null, false, textPrimary, textSecondary, tipGrafic, "PM10", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, trendPm10, lastHistoryTimeUnix) { v -> if (v == -999f) Color.Transparent else if (v < 15) Color(0XFF40CE19) else if (v < 45) Color(0xFFFAF250) else if (v < 100) Color(0xFFF5961A) else Color(0xFFE21E1E) }
+                SenzorCard("PM 1.0", animPm1, false, istoricPM1, intervalSelectat, false, null, false, textPrimary, textSecondary, tipGrafic, "PM1", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, trendPm1, lastHistoryTimeUnix, colorLogic = ::getPm1Color)
+                SenzorCard("PM 2.5", animPm25, false, istoricPM25, intervalSelectat, false, null, false, textPrimary, textSecondary, tipGrafic, "PM25", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, trendPm25, lastHistoryTimeUnix, colorLogic = ::getPm25Color)
+                SenzorCard("PM 4.0", animPm4, false, istoricPM4, intervalSelectat, false, null, false, textPrimary, textSecondary, tipGrafic, "PM4", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, trendPm4, lastHistoryTimeUnix, colorLogic = ::getPm4Color)
+                SenzorCard("PM 10", animPm10, false, istoricPM10, intervalSelectat, false, null, false, textPrimary, textSecondary, tipGrafic, "PM10", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, trendPm10, lastHistoryTimeUnix, colorLogic = ::getPm10Color)
             },
             contentGaze = {
-                SenzorCard("CO2 (ppm)", animCo2, false, istoricCO2, intervalSelectat, false, null, true, textPrimary, textSecondary, tipGrafic, "CO2", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, trendCo2, lastHistoryTimeUnix) { v -> if (v == -999f) Color.Transparent else if (v < 800) Color(0XFF40CE19) else if (v < 1200) Color(0xFFFAF250) else if (v < 1600) Color(0xFFF5961A) else Color(0xFFE21E1E) }
-                SenzorCard("VOC (Index)", animVoc, voc > 1000f, istoricVOC, intervalSelectat, false, 500f, true, textPrimary, textSecondary, tipGrafic, "VOC", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, trendVoc, lastHistoryTimeUnix, esteIndex = true) { v -> if (v == -999f) Color.Transparent else if (v < 150) Color(0XFF40CE19) else if (v < 250) Color(0xFFFAF250) else if (v < 400) Color(0xFFF5961A) else Color(0xFFE21E1E) }
-                SenzorCard("NOx (Index)", animNox, nox > 1000f, istoricNOx, intervalSelectat, false, 500f, true, textPrimary, textSecondary, tipGrafic, "NOx", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, trendNox, lastHistoryTimeUnix, esteIndex = true) { v -> if (v == -999f) Color.Transparent else if (v < 20) Color(0XFF40CE19) else if (v < 150) Color(0xFFFAF250) else if (v < 300) Color(0xFFF5961A) else Color(0xFFE21E1E) }
+                SenzorCard("CO2 (ppm)", animCo2, false, istoricCO2, intervalSelectat, false, null, true, textPrimary, textSecondary, tipGrafic, "CO2", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, trendCo2, lastHistoryTimeUnix, colorLogic = ::getCo2Color)
+                SenzorCard("VOC (Index)", animVoc, voc > 1000f, istoricVOC, intervalSelectat, false, 500f, true, textPrimary, textSecondary, tipGrafic, "VOC", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, trendVoc, lastHistoryTimeUnix, esteIndex = true, colorLogic = ::getVocColor)
+                SenzorCard("NOx (Index)", animNox, nox > 1000f, istoricNOx, intervalSelectat, false, 500f, true, textPrimary, textSecondary, tipGrafic, "NOx", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, trendNox, lastHistoryTimeUnix, esteIndex = true, colorLogic = ::getNoxColor)
             },
             contentClima = {
                 SenzorCard("Temperatură (°C)", animTemp, false, istoricTemp, intervalSelectat, false, null, false, textPrimary, textSecondary, tipGrafic, "Temp", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.TEMPERATURE, trendTemp, lastHistoryTimeUnix, douaZecimaleLive = true, colorLogic = ::getTempColor)
@@ -1575,12 +1649,12 @@ fun EcranArhiva(
                 prefs = prefs, surfaceColor = surfaceColor, textSecondary = textSecondary,
                 categoryOrder = categoryOrder, onOrderChange = onOrderChange,
                 contentPraf = {
-                    SenzorCard("PM 2.5 (Praf)", 0f, true, dateZi["PM25"] ?: emptyList(), IntervalTimp.ORE_24, true, null, false, textPrimary, textSecondary, tipGrafic, "AR_PM25", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, 0, 0L) { v -> if (v == -999f) Color.Transparent else if (v < 5) Color(0XFF40CE19) else if (v < 12) Color(0xFFFAF250) else if (v < 35) Color(0xFFF5961A) else Color(0xFFE21E1E) }
+                    SenzorCard("PM 2.5 (Praf)", 0f, true, dateZi["PM25"] ?: emptyList(), IntervalTimp.ORE_24, true, null, false, textPrimary, textSecondary, tipGrafic, "AR_PM25", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, 0, 0L, colorLogic = ::getPm25Color)
                 },
                 contentGaze = {
-                    SenzorCard("CO2 (Dioxid de Carbon)", 0f, true, dateZi["CO2"] ?: emptyList(), IntervalTimp.ORE_24, true, null, true, textPrimary, textSecondary, tipGrafic, "AR_CO2", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, 0, 0L) { v -> if (v == -999f) Color.Transparent else if (v < 800) Color(0XFF40CE19) else if (v < 1200) Color(0xFFFAF250) else if (v < 1600) Color(0xFFF5961A) else Color(0xFFE21E1E) }
-                    SenzorCard("VOC (Chimicale)", 0f, true, dateZi["VOC"] ?: emptyList(), IntervalTimp.ORE_24, true, 500f, true, textPrimary, textSecondary, tipGrafic, "AR_VOC", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, 0, 0L, esteIndex = true) { v -> if (v == -999f) Color.Transparent else if (v < 150) Color(0XFF40CE19) else if (v < 250) Color(0xFFFAF250) else if (v < 400) Color(0xFFF5961A) else Color(0xFFE21E1E) }
-                    SenzorCard("NOx (Gaze eșapament)", 0f, true, dateZi["NOx"] ?: emptyList(), IntervalTimp.ORE_24, true, 500f, true, textPrimary, textSecondary, tipGrafic, "AR_NOx", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, 0, 0L, esteIndex = true) { v -> if (v == -999f) Color.Transparent else if (v < 20) Color(0XFF40CE19) else if (v < 150) Color(0xFFFAF250) else if (v < 300) Color(0xFFF5961A) else Color(0xFFE21E1E) }
+                    SenzorCard("CO2 (Dioxid de Carbon)", 0f, true, dateZi["CO2"] ?: emptyList(), IntervalTimp.ORE_24, true, null, true, textPrimary, textSecondary, tipGrafic, "AR_CO2", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, 0, 0L, colorLogic = ::getCo2Color)
+                    SenzorCard("VOC (Chimicale)", 0f, true, dateZi["VOC"] ?: emptyList(), IntervalTimp.ORE_24, true, 500f, true, textPrimary, textSecondary, tipGrafic, "AR_VOC", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, 0, 0L, esteIndex = true, colorLogic = ::getVocColor)
+                    SenzorCard("NOx (Gaze eșapament)", 0f, true, dateZi["NOx"] ?: emptyList(), IntervalTimp.ORE_24, true, 500f, true, textPrimary, textSecondary, tipGrafic, "AR_NOx", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.POLLUTANTS, 0, 0L, esteIndex = true, colorLogic = ::getNoxColor)
                 },
                 contentClima = {
                     SenzorCard("Temperatură (°C)", 0f, true, dateZi["Temp"] ?: emptyList(), IntervalTimp.ORE_24, true, null, false, textPrimary, textSecondary, tipGrafic, "AR_Temp", globalTouchIndex, activeChartId, onGlobalTouch, TrendScheme.TEMPERATURE, 0, 0L, colorLogic = ::getTempColor)
@@ -1638,9 +1712,9 @@ fun EcranSetari(
     if (showRestartDialog) {
         AlertDialog(
             onDismissRequest = { showRestartDialog = false },
-            title = { Text("Restartare Sistem", fontWeight = FontWeight.Bold, color = Color.Red) },
+            title = { Text("Restartare Sistem", fontWeight = FontWeight.Bold, color = Paleta.Rosu1) },
             text = { Text("Plăcuța ESP32 va fi oprită și repornită forțat. Conexiunea WiFi se va întrerupe pentru câteva secunde. Continuăm?") },
-            confirmButton = { TextButton(onClick = { showRestartDialog = false; onRestartBoard() }) { Text("Restart", color = Color.Red) } },
+            confirmButton = { TextButton(onClick = { showRestartDialog = false; onRestartBoard() }) { Text("Restart", color = Paleta.Rosu1) } },
             dismissButton = { TextButton(onClick = { showRestartDialog = false }) { Text("Anulează", color = textSecondary) } },
             containerColor = surfaceColor, titleContentColor = textPrimary, textContentColor = textPrimary
         )
@@ -1648,9 +1722,9 @@ fun EcranSetari(
     if (showResetVocDialog) {
         AlertDialog(
             onDismissRequest = { showResetVocDialog = false },
-            title = { Text("Resetare Calibrare VOC", fontWeight = FontWeight.Bold, color = Color.Red) },
+            title = { Text("Resetare Calibrare VOC", fontWeight = FontWeight.Bold, color = Paleta.Rosu1) },
             text = { Text("Această acțiune șterge permanent memoria învățată a algoritmului VOC. Senzorul va avea nevoie de 12-24 de ore să se re-calibreze singur. Aparatul se restartează automat. Ești sigur?") },
-            confirmButton = { TextButton(onClick = { showResetVocDialog = false; onResetVoc() }) { Text("Resetare", color = Color.Red) } },
+            confirmButton = { TextButton(onClick = { showResetVocDialog = false; onResetVoc() }) { Text("Resetare", color = Paleta.Rosu1) } },
             dismissButton = { TextButton(onClick = { showResetVocDialog = false }) { Text("Anulează", color = textSecondary) } },
             containerColor = surfaceColor, titleContentColor = textPrimary, textContentColor = textPrimary
         )
@@ -1686,20 +1760,20 @@ fun EcranSetari(
                     Spacer(modifier = Modifier.height(16.dp))
                     LazyColumn(modifier = Modifier.weight(1f, fill = false)) {
                         if (parsedErrors.isEmpty()) {
-                            item { Text("Sistemul funcționează perfect! Nicio eroare.", color = Color.Green) }
+                            item { Text("Sistemul funcționează perfect! Nicio eroare.", color = Paleta.Verde1) }
                         } else {
                             items(parsedErrors) { err ->
                                 val errColor = when {
                                     err.contains("Calibrare VOC", ignoreCase = true) -> textPrimary
-                                    err.contains("Curatare", ignoreCase = true) || err.contains("Offset", ignoreCase = true) -> Color(0xFFFFFF0A)
-                                    err.contains("OTA", ignoreCase = true) || err.contains("USB", ignoreCase = true) -> Color(0xFFFF9600)
-                                    err.contains("refacuta", ignoreCase = true) -> Color(0xFFAF52DE)
-                                    err.contains("creata", ignoreCase = true) -> Color(0xFF34C759)
+                                    err.contains("Curatare", ignoreCase = true) || err.contains("Offset", ignoreCase = true) -> Paleta.Galben1
+                                    err.contains("OTA", ignoreCase = true) || err.contains("USB", ignoreCase = true) -> Paleta.Portocaliu1
+                                    err.contains("refacuta", ignoreCase = true) -> Paleta.Mov1
+                                    err.contains("creata", ignoreCase = true) -> Paleta.Verde1
                                     err.contains("Eroare", ignoreCase = true) || err.contains("WDT", ignoreCase = true) ||
                                             err.contains("Panic", ignoreCase = true) || err.contains("Blocat", ignoreCase = true) ||
                                             err.contains("Restart", ignoreCase = true) || err.contains("Pierdut", ignoreCase = true) ||
-                                            err.contains("Deconectat", ignoreCase = true) || err.contains("Fail", ignoreCase = true) -> Color.Red
-                                    else -> Color(0xFF007AFF)
+                                            err.contains("Deconectat", ignoreCase = true) || err.contains("Fail", ignoreCase = true) -> Paleta.Rosu1
+                                    else -> Paleta.Albastru2
                                 }
                                 Text(err, color = errColor, fontSize = 12.sp, modifier = Modifier.padding(bottom = 8.dp))
                             }
@@ -1879,7 +1953,7 @@ fun EcranSetari(
                             checked = autoNightMode,
                             onCheckedChange = { autoNightMode = it; prefs.edit(commit = true) { putBoolean("nightModeAuto", it) }; database.child("setari/nm_auto").setValue(it) },
                             modifier = Modifier.scale(0.7f).height(24.dp),
-                            colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = accentColor, uncheckedThumbColor = Color(0xFF8E8E93), uncheckedTrackColor = if (surfaceColor == Color.White) Color(0xFFE5E5EA) else Color(0xFF3A3A3C), uncheckedBorderColor = Color.Transparent)
+                            colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = accentColor, uncheckedThumbColor = Paleta.Gri1, uncheckedTrackColor = if (surfaceColor == Color.White) Paleta.Alb2 else Paleta.Gri2, uncheckedBorderColor = Color.Transparent)
                         )
                     }
                     AnimatedVisibility(visible = autoNightMode) {
@@ -1942,7 +2016,7 @@ fun EcranSetari(
         Spacer(modifier = Modifier.height(12.dp))
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
             // Tema light
-            Box(modifier = Modifier.size(130.dp, 90.dp).clip(RoundedCornerShape(16.dp)).background(Color(0xFFF2F2F7)).border(if (!isDarkMode) 3.dp else 1.dp, if (!isDarkMode) accentColor else Color.LightGray.copy(alpha = 0.5f), RoundedCornerShape(16.dp)).padding(12.dp).clickable { onThemeChange(false) }) {
+            Box(modifier = Modifier.size(130.dp, 90.dp).clip(RoundedCornerShape(16.dp)).background(Paleta.Alb1).border(if (!isDarkMode) 3.dp else 1.dp, if (!isDarkMode) accentColor else Color.LightGray.copy(alpha = 0.5f), RoundedCornerShape(16.dp)).padding(12.dp).clickable { onThemeChange(false) }) {
                 Column {
                     Box(modifier = Modifier.fillMaxWidth().height(16.dp).clip(RoundedCornerShape(4.dp)).background(Color.White))
                     Spacer(Modifier.height(12.dp))
@@ -1954,9 +2028,9 @@ fun EcranSetari(
                 }
             }
             // Tema dark
-            Box(modifier = Modifier.size(130.dp, 90.dp).clip(RoundedCornerShape(16.dp)).background(Color(0xFF121212)).border(if (isDarkMode) 3.dp else 1.dp, if (isDarkMode) accentColor else Color.DarkGray.copy(alpha = 0.5f), RoundedCornerShape(16.dp)).padding(12.dp).clickable { onThemeChange(true) }) {
+            Box(modifier = Modifier.size(130.dp, 90.dp).clip(RoundedCornerShape(16.dp)).background(Paleta.Negru1).border(if (isDarkMode) 3.dp else 1.dp, if (isDarkMode) accentColor else Color.DarkGray.copy(alpha = 0.5f), RoundedCornerShape(16.dp)).padding(12.dp).clickable { onThemeChange(true) }) {
                 Column {
-                    Box(modifier = Modifier.fillMaxWidth().height(16.dp).clip(RoundedCornerShape(4.dp)).background(Color(0xFF2C2C2E)))
+                    Box(modifier = Modifier.fillMaxWidth().height(16.dp).clip(RoundedCornerShape(4.dp)).background(Paleta.Gri3))
                     Spacer(Modifier.height(12.dp))
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Box(modifier = Modifier.size(12.dp).clip(CircleShape).background(accentColor))
@@ -1967,13 +2041,13 @@ fun EcranSetari(
             }
         }
         Spacer(modifier = Modifier.height(12.dp))
-        Row(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(surfaceColor).padding(16.dp), horizontalArrangement = Arrangement.SpaceAround) {
+        Row(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(surfaceColor).border(1.dp, if (surfaceColor == Color.White) Paleta.Alb3 else Color.Transparent, RoundedCornerShape(12.dp)).padding(16.dp), horizontalArrangement = Arrangement.SpaceAround) {
             culoriDisponibile.forEach { (colorInt, _) ->
                 Box(modifier = Modifier.size(40.dp).clip(CircleShape).background(Color(colorInt)).border(width = if (accentColor == Color(colorInt)) 3.dp else 0.dp, color = if (accentColor == Color(colorInt)) textPrimary else Color.Transparent, shape = CircleShape).clickable { onColorChange(colorInt) })
             }
         }
         Spacer(modifier = Modifier.height(12.dp))
-        Row(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(surfaceColor).padding(8.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+        Row(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(surfaceColor).border(1.dp, if (surfaceColor == Color.White) Paleta.Alb3 else Color.Transparent, RoundedCornerShape(12.dp)).padding(8.dp), horizontalArrangement = Arrangement.SpaceBetween) {
             listOf("Bars", "Spline", "Step").forEachIndexed { index, titlu ->
                 Box(modifier = Modifier.weight(1f).padding(4.dp).clip(RoundedCornerShape(8.dp)).background(if (tipGrafic == index) accentColor else Color.Transparent).clickable { onTipGraficChange(index) }.padding(vertical = 12.dp), contentAlignment = Alignment.Center) {
                     Text(titlu, color = if (tipGrafic == index) Color.White else textPrimary, fontWeight = FontWeight.Medium, fontSize = 14.sp)
@@ -1989,11 +2063,11 @@ fun EcranSetari(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("LIVE", color = textSecondary, fontSize = 10.sp, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.width(4.dp))
-                Switch(checked = liveModeActiv, onCheckedChange = onLiveModeChange, modifier = Modifier.scale(0.55f), colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = accentColor, uncheckedThumbColor = Color(0xFF8E8E93), uncheckedTrackColor = if (surfaceColor == Color.White) Color(0xFFE5E5EA) else Color(0xFF3A3A3C), uncheckedBorderColor = Color.Transparent))
+                Switch(checked = liveModeActiv, onCheckedChange = onLiveModeChange, modifier = Modifier.scale(0.55f), colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = accentColor, uncheckedThumbColor = Paleta.Gri1, uncheckedTrackColor = if (surfaceColor == Color.White) Paleta.Alb2 else Paleta.Gri2, uncheckedBorderColor = Color.Transparent))
             }
         }
         Spacer(modifier = Modifier.height(12.dp))
-        Row(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(surfaceColor).clickable { showLiveModeDialog = true }.padding(12.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+        Row(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(surfaceColor).border(1.dp, if (surfaceColor == Color.White) Paleta.Alb3 else Color.Transparent, RoundedCornerShape(12.dp)).clickable { showLiveModeDialog = true }.padding(12.dp), horizontalArrangement = Arrangement.SpaceBetween) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) { Text("RAM", color = textSecondary, fontSize = 10.sp); Text("${telemetrieRam / 1024} KB", color = textPrimary, fontSize = 14.sp, fontWeight = FontWeight.Bold) }
             Column(horizontalAlignment = Alignment.CenterHorizontally) { Text("CPU", color = textSecondary, fontSize = 10.sp); Text("${"%.1f".format(telemetrieTemp)}°C", color = textPrimary, fontSize = 14.sp, fontWeight = FontWeight.Bold) }
             Column(horizontalAlignment = Alignment.CenterHorizontally) { Text("WiFi", color = textSecondary, fontSize = 10.sp); Text("$telemetrieRssi dBm", color = textPrimary, fontSize = 14.sp, fontWeight = FontWeight.Bold) }
@@ -2001,18 +2075,18 @@ fun EcranSetari(
         }
         Spacer(modifier = Modifier.height(8.dp))
 
-        Button(onClick = { showErrorDialog = true }, colors = ButtonDefaults.buttonColors(containerColor = surfaceColor), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) { Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Info, null, tint = Color(0xFFFF9500)); Spacer(Modifier.width(16.dp)); Text("Jurnal Erori (Ultimele 24h)", color = textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium) } }
-        Button(onClick = { showRestartDialog = true }, colors = ButtonDefaults.buttonColors(containerColor = surfaceColor), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) { Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Warning, null, tint = Color.Red); Spacer(Modifier.width(16.dp)); Text("Restartare Sistem", color = Color.Red, fontSize = 16.sp, fontWeight = FontWeight.Medium) } }
-        Button(onClick = { showResetVocDialog = true }, colors = ButtonDefaults.buttonColors(containerColor = surfaceColor), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) { Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Refresh, null, tint = Color(0xFFFF9500)); Spacer(Modifier.width(16.dp)); Text("Resetare Calibrare VOC", color = textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium) } }
-        Button(onClick = { showCalibCo2Dialog = true }, colors = ButtonDefaults.buttonColors(containerColor = surfaceColor), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) { Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Refresh, null, tint = Color(0xFF34C759)); Spacer(Modifier.width(16.dp)); Text("Calibrare CO2 (aer proaspăt)", color = textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium) } }
-        Button(onClick = { showCleanDialog = true }, colors = ButtonDefaults.buttonColors(containerColor = surfaceColor), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) { Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Settings, null, tint = accentColor); Spacer(Modifier.width(16.dp)); Text("Curățare Senzor SEN66", color = textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium) } }
-        Button(onClick = { showExportDialog = true }, colors = ButtonDefaults.buttonColors(containerColor = surfaceColor), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) { Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Share, null, tint = Color(0xFF34C759)); Spacer(Modifier.width(16.dp)); Text("Exportă Datele (.csv)", color = textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium) } }
+        Button(onClick = { showErrorDialog = true }, colors = ButtonDefaults.buttonColors(containerColor = surfaceColor), shape = RoundedCornerShape(12.dp), border = if (surfaceColor == Color.White) BorderStroke(1.dp, Paleta.Alb3) else null, modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) { Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Info, null, tint = Paleta.Mov1); Spacer(Modifier.width(16.dp)); Text("Jurnal Erori (Ultimele 24h)", color = textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium) } }
+        Button(onClick = { showRestartDialog = true }, colors = ButtonDefaults.buttonColors(containerColor = surfaceColor), shape = RoundedCornerShape(12.dp), border = if (surfaceColor == Color.White) BorderStroke(1.dp, Paleta.Alb3) else null, modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) { Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Warning, null, tint = Paleta.Rosu1); Spacer(Modifier.width(16.dp)); Text("Restartare Sistem", color = Paleta.Rosu1, fontSize = 16.sp, fontWeight = FontWeight.Medium) } }
+        Button(onClick = { showResetVocDialog = true }, colors = ButtonDefaults.buttonColors(containerColor = surfaceColor), shape = RoundedCornerShape(12.dp), border = if (surfaceColor == Color.White) BorderStroke(1.dp, Paleta.Alb3) else null, modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) { Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Refresh, null, tint = Paleta.Portocaliu1); Spacer(Modifier.width(16.dp)); Text("Resetare Calibrare VOC", color = textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium) } }
+        Button(onClick = { showCalibCo2Dialog = true }, colors = ButtonDefaults.buttonColors(containerColor = surfaceColor), shape = RoundedCornerShape(12.dp), border = if (surfaceColor == Color.White) BorderStroke(1.dp, Paleta.Alb3) else null, modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) { Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Refresh, null, tint = Paleta.Galben1); Spacer(Modifier.width(16.dp)); Text("Calibrare CO2 (aer proaspăt)", color = textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium) } }
+        Button(onClick = { showCleanDialog = true }, colors = ButtonDefaults.buttonColors(containerColor = surfaceColor), shape = RoundedCornerShape(12.dp), border = if (surfaceColor == Color.White) BorderStroke(1.dp, Paleta.Alb3) else null, modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) { Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Settings, null, tint = Paleta.Albastru1); Spacer(Modifier.width(16.dp)); Text("Curățare Senzor SEN66", color = textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium) } }
+        Button(onClick = { showExportDialog = true }, colors = ButtonDefaults.buttonColors(containerColor = surfaceColor), shape = RoundedCornerShape(12.dp), border = if (surfaceColor == Color.White) BorderStroke(1.dp, Paleta.Alb3) else null, modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) { Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Share, null, tint = Paleta.Verde1); Spacer(Modifier.width(16.dp)); Text("Exportă Datele (.csv)", color = textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium) } }
 
         // Offset temperatură
         var localOffset by remember { mutableFloatStateOf(tempOffsetServer) }
         var isOffsetDragging by remember { mutableStateOf(false) }
         LaunchedEffect(tempOffsetServer) { if (!isOffsetDragging) localOffset = tempOffsetServer }
-        Column(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(surfaceColor).padding(16.dp)) {
+        Column(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(surfaceColor).border(1.dp, if (surfaceColor == Color.White) Paleta.Alb3 else Color.Transparent, RoundedCornerShape(12.dp)).padding(16.dp)) {
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Text("Offset Temperatură", color = textPrimary, fontSize = 18.sp, fontWeight = FontWeight.Medium)
                 Text("${if (localOffset > 0) "+" else ""}${"%.1f".format(localOffset)} °C", color = accentColor, fontSize = 18.sp, fontWeight = FontWeight.Bold)
@@ -2034,7 +2108,7 @@ fun EcranSetari(
         Spacer(modifier = Modifier.height(8.dp))
 
         // Pauză alerte
-        Column(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(surfaceColor).padding(16.dp)) {
+        Column(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(surfaceColor).border(1.dp, if (surfaceColor == Color.White) Paleta.Alb3 else Color.Transparent, RoundedCornerShape(12.dp)).padding(16.dp)) {
             var notifFreq by remember { mutableFloatStateOf(((prefs.getInt("notifFreqMins", 10) / 10f).roundToInt() * 10).toFloat().coerceIn(10f, 120f)) }
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Text("Pauză Alerte", color = textPrimary, fontSize = 18.sp, fontWeight = FontWeight.Medium)
@@ -2055,7 +2129,7 @@ fun SetareSwitch(
     onClick: () -> Unit = {}, onCheckedChange: (Boolean) -> Unit
 ) {
     Row(
-        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(surfaceColor).clickable { onClick() }.padding(16.dp),
+        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(surfaceColor).border(1.dp, if (surfaceColor == Color.White) Paleta.Alb3 else Color.Transparent, RoundedCornerShape(12.dp)).clickable { onClick() }.padding(16.dp),
         horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically
     ) {
         Column(modifier = Modifier.weight(1f).padding(end = 16.dp)) {
@@ -2064,7 +2138,7 @@ fun SetareSwitch(
         }
         Switch(
             checked = checked, onCheckedChange = onCheckedChange,
-            colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = accentColor, uncheckedThumbColor = Color(0xFF8E8E93), uncheckedTrackColor = if (surfaceColor == Color.White) Color(0xFFE5E5EA) else Color(0xFF3A3A3C), uncheckedBorderColor = Color.Transparent)
+            colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = accentColor, uncheckedThumbColor = Paleta.Gri1, uncheckedTrackColor = if (surfaceColor == Color.White) Paleta.Alb2 else Paleta.Gri2, uncheckedBorderColor = Color.Transparent)
         )
     }
 }
@@ -2096,9 +2170,9 @@ fun SenzorCard(
                     val isNeutral = trendValue == 0; val isUp = trendValue > 0
                     val arrowColor = when {
                         isNeutral -> textSecondary
-                        trendScheme == TrendScheme.POLLUTANTS -> if (isUp) Color(0xFFE53935) else Color(0xFF43A047)
-                        trendScheme == TrendScheme.TEMPERATURE -> if (isUp) Color(0xFFE53935) else Color(0xFF1E88E5)
-                        trendScheme == TrendScheme.HUMIDITY -> if (isUp) Color(0xFF1E88E5) else Color(0xFFFBC02D)
+                        trendScheme == TrendScheme.POLLUTANTS -> if (isUp) Paleta.Rosu1 else Paleta.Verde1
+                        trendScheme == TrendScheme.TEMPERATURE -> if (isUp) Paleta.Rosu1 else Paleta.Albastru1
+                        trendScheme == TrendScheme.HUMIDITY -> if (isUp) Paleta.Albastru1 else Paleta.Maro1
                         else -> textSecondary
                     }
                     Box(contentAlignment = Alignment.Center, modifier = Modifier.padding(end = 6.dp).height(24.dp)) {
