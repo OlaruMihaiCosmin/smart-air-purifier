@@ -67,20 +67,17 @@ notificări push FCM.
 
 ## Arhitectură
 
-```
-        ┌───────────────────────────┐                         ┌────────────────────────────┐
-        │   UNITATE DE CONTROL      │                         │     APLICAȚIE ANDROID       │
-        │   ESP32-S3                │                         │     (Kotlin + Compose)      │
-        │                           │      ┌───────────┐      │                             │
-        │  • Senzor SEN66           │ ───► │  FIREBASE │ ───► │  • Dashboard live           │
-        │  • Ecran TFT ST7789       │      │  Realtime │      │  • Grafice + arhivă 28 zile │
-        │  • LED WS2812             │ ◄─── │  Database │ ◄─── │  • Widget home-screen       │
-        │  • Ventilatoare PWM+taho  │      └───────────┘      │  • Control AUTO / manual    │
-        │  • WiFi + OTA             │            │            │                             │
-        └───────────────────────────┘            │            └────────────────────────────┘
-                     │                            │                          ▲
-                     │      alertă poluare        ▼      dispozitiv offline  │
-                     └──────────────────►  FCM (push)  ◄───── WorkManager ───┘
+```mermaid
+flowchart TB
+    ESP["Unitate de control — ESP32-S3<br/>SEN66 · TFT ST7789 · LED WS2812 · ventilatoare PWM+taho"]
+    FB[("Firebase<br/>Realtime Database + Cloud Messaging")]
+    APP["Aplicație Android — Kotlin + Compose<br/>dashboard · grafice · arhivă 28 zile · widget · control"]
+
+    ESP -->|"telemetrie"| FB
+    FB -->|"setări (stream)"| ESP
+    APP <-->|"date live"| FB
+    ESP -->|"alertă poluare — push FCM"| APP
+    APP -.->|"verificare offline — WorkManager"| FB
 ```
 
 **Flux de date**
@@ -103,7 +100,7 @@ notificări push FCM.
 | **Sensirion SEN66** | Senzor combo: particule (PM1–PM10), CO₂, VOC, NOx, temperatură, umiditate |
 | **Ecran TFT ST7789 2.0"** | Afișaj local al valorilor în timp real |
 | **LED WS2812 (NeoPixel)** | Indicator RGB de stare a calității aerului |
-| **5 × ventilatoare Arctic P14 PWM** | Flux de aer reglabil + citire turație (tahometru) |
+| **5 × ventilatoare Arctic P14 Pro Pst** | Flux de aer reglabil + citire turație (tahometru) |
 | **4 × filtre IKEA Starkvind** | Mediu de filtrare (eficiență ~99,5% pentru PM2.5) |
 | **Cutie Corsi–Rosenthal** | Structura DIY care leagă filtrele și ventilatoarele |
 
