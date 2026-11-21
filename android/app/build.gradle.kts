@@ -1,4 +1,6 @@
 import java.util.Properties
+import java.time.Instant
+import java.time.temporal.ChronoUnit
 
 plugins {
     alias(libs.plugins.android.application)
@@ -26,8 +28,10 @@ android {
         applicationId = "com.example.smartpurifier"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
+        // Incrementam codul si versiunea la fiecare livrare modificata.
+        versionCode = 5
+        versionName = "2026.10.04.1"
+        buildConfigField("String", "BUILD_TIME_UTC", "\"${Instant.now().truncatedTo(ChronoUnit.SECONDS)}\"")
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
