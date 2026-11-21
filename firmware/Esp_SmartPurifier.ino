@@ -31,6 +31,14 @@
 #include <ArduinoOTA.h>
 #include <esp_task_wdt.h>
 #include <math.h>
+#include "SmartAirReliability.h"
+#include "SmartAirCloudHealth.h"
+#include "SmartAirTimer.h"
+#include "esp_sntp.h"
+
+// Incrementam versiunea la fiecare livrare modificata; build-ul identifica si recompilarea.
+constexpr char VERSIUNE_FIRMWARE[] = "2026.10.01.1";
+constexpr char BUILD_FIRMWARE[] = __DATE__ " " __TIME__;
 
 // ================= DEBUG CONTROL =================
 #define DEBUG_SERIAL
@@ -51,6 +59,23 @@
 
 const char* TZ_INFO   = "EET-2EEST,M3.5.0/3,M10.5.0/4";
 const char* ntpServer = "pool.ntp.org";
+PlanificatorNtp planificatorNtp;
+bool sincronizareNtpConfirmata = false;
+
+void confirmaNtp(struct timeval*) {
+  __atomic_store_n(&sincronizareNtpConfirmata, true, __ATOMIC_RELAXED);
+}
+
+bool ceasValid() {
+  return __atomic_load_n(&sincronizareNtpConfirmata, __ATOMIC_RELAXED) && time(nullptr) >= 1704067200;
+}
+
+void intretineCeas(uint32_t acum) {
+  if (planificatorNtp.solicita(WiFi.status() == WL_CONNECTED, ceasValid(), acum)) {
+    // Pornirea SNTP este asincrona; nu blocam purificarea cat timp routerul isi revine.
+    configTzTime(TZ_INFO, ntpServer, "time.cloudflare.com", "time.nist.gov");
+  }
+}
 
 // Pini Hardware S3
 #define I2C_SDA 8
@@ -88,6 +113,8 @@ FirebaseData   fbdoFcm;      // folosit doar la trimiterea notificarilor push FC
 FirebaseAuth   auth;
 FirebaseConfig config;
 bool firebaseGata = false;
+StareCloud stareCloud;
+bool firebaseAvertizat = false;
 bool fcmActiv     = false;   // true doar daca cheile de service account sunt completate
 
 Preferences storace;
@@ -99,8 +126,9 @@ bool eraAutoInainte    = false;
 
 bool istoricRecuperat  = false;
 bool bootLogSent       = false;
-int  lastSavedMin      = -1;
+time_t ultimulSlotSalvat = 0;
 String lastArchivedDateStr = "";
+String arhivaDiagnosticInAsteptare = "";  // Oglinda pasiva; logica arhivarii detine starea.
 long   lastIstoricSaveTime = 0;
 unsigned long tAntSenzor = 0, tAntEcran = 0, tAntLive = 0,
               tAntFading = 0, tAntRpm = 0, tAntWifi = 0, tAntVocSave = 0,
@@ -108,12 +136,26 @@ unsigned long tAntSenzor = 0, tAntEcran = 0, tAntLive = 0,
 
 unsigned long tUltimaCitireReusita = 0;
 unsigned long tSenzorStart         = 0;
+bool warmupSenzorTerminat = false;
+bool diagnosticAreCitireSenzor = false;
+uint64_t diagnosticUltimaCitireMs = 0;
 
+uint32_t varstaSenzor(uint32_t t) {
+  const uint32_t varsta = t - tSenzorStart;
+  if (varsta >= 60000UL) warmupSenzorTerminat = true;
+  // Dupa stabilizare, rotatia millis nu trebuie sa reporneasca incalzirea.
+  return warmupSenzorTerminat ? 60000UL : varsta;
+}
+
+ValiditateSenzor validitateSenzor{};
 bool areDate     = false;
 bool isNightMode = false;
 bool nightModeApp = false;
+bool nightModePrimit = false;  // Valoarea din Firebase; programarea decide separat starea efectiva.
 
 int  vitezaDinAplicatie = 0;
+int  vitezaBaza = 0;  // speed din cloud; timerul suprapune temporar cererea efectiva.
+StareTimer stareTimer;
 int  luminozitateEcran  = 100;
 int  luminozitateLed    = 150;
 int  targetFanSpeed     = 0;
@@ -124,11 +166,11 @@ bool modLiveRapid       = false;
 float offsetTemperatura = -1.0;
 
 // Praguri alerte push (sincronizate din aplicatie prin /SenzoriAer/setari)
-float alertPm      = 35.0;
-int   alertCo2     = 1500;
+float alertPm      = 20.0;
+int   alertCo2     = 1600;
 float alertVoc     = 250.0;
-float alertNox     = 150.0;
-int   notifFreqMin = 10;
+float alertNox     = 30.0;
+int   notifFreqMin = 30;
 bool  notifPraf = true, notifGaze = true;
 unsigned long tUltimaAlertaPraf = 0, tUltimaAlertaGaze = 0;
 
@@ -136,7 +178,7 @@ unsigned long tUltimaAlertaPraf = 0, tUltimaAlertaGaze = 0;
 // dupa ceasul propriu NTP — functioneaza si cu telefonul inchis/descarcat.
 bool nmAuto = false;
 int  nmStartMin = 23 * 60, nmEndMin = 7 * 60;
-unsigned long tAntNmCheck = 0;
+uint32_t tAntNmPublicare = 0;
 
 // Istoric local inainte de prima sincronizare cu Firebase (boot fara WiFi):
 // punctele se salveaza la cadenta de 5 min pe ceasul intern (millis), iar la prima
@@ -147,6 +189,7 @@ unsigned long millisPrimaSalvareLocala = 0, millisUltimaSalvareLocala = 0;
 
 RTC_NOINIT_ATTR char rtc_last_state[64];
 String motivRestart = "";
+String etapaAnterioaraReset = "";
 
 // =========================================================================
 // VARIABILE PENTRU ANIMATIILE FLICKER-FREE (UI Dashboard)
@@ -217,8 +260,8 @@ void clearI2CBus(int sdaPin, int sclPin) {
 
 String getPaddedHistory(String istoric, time_t tNow, long lastSave) {
   if (lastSave <= 0) return istoric;
-  int secundePierdute  = tNow - lastSave;
-  int intervalePierdute = (secundePierdute / 300) - 1;
+  // Probele offline pot avea secunde diferite; comparam sloturile, nu durata trunchiata.
+  int intervalePierdute = (tNow / 300) - (lastSave / 300) - 1;
   if (intervalePierdute <= 0) return istoric;
   if (intervalePierdute > 288) intervalePierdute = 288;
   String rezultat = istoric;
@@ -237,6 +280,16 @@ String getPaddedHistory(String istoric, time_t tNow, long lastSave) {
 }
 
 String extrageArhivaIeri(String dateCurente, int puncteAzi) {
+  // Istoricul scurt este o coada de zi, nu inceputul zilei. Completam in stanga.
+  int probe = dateCurente.length() ? 1 : 0;
+  for (unsigned int i=0; i<dateCurente.length(); ++i) if (dateCurente[i] == ',') ++probe;
+  while (probe > 288) { dateCurente.remove(0, dateCurente.indexOf(',') + 1); --probe; }
+  String prefix;
+  for (int i=probe; i<288; ++i) { if (prefix.length()) prefix += ","; prefix += "-999"; }
+  if (prefix.length() && dateCurente.length()) prefix += ",";
+  prefix += dateCurente;
+  dateCurente = prefix;
+  if (puncteAzi < 0) puncteAzi = 0;
   if (puncteAzi >= 288) puncteAzi = 288;
   int puncteIeriRamase = 288 - puncteAzi;
   if (puncteIeriRamase <= 0) {
@@ -286,21 +339,30 @@ void IRAM_ATTR tachoPoll(void* arg) {
   else if (highSamples >= 4 && tachoState == LOW)  { tachoState = HIGH; }
 }
 
-float pm1=-1, pm25=-1, pm4=-1, pm10=-1, umiditate=0, temp=0, voc=65535, nox=65535;
+float pm1=-1, pm25=-1, pm4=-1, pm10=-1, umiditate=-999, temp=-999, voc=65535, nox=65535;
 uint16_t co2 = 0;
 
 float sumPM1=0, sumPM25=0, sumPM4=0, sumPM10=0, sumTemp=0, sumUmid=0, sumVOC=0, sumNOx=0;
 unsigned long sumCO2 = 0;
-// NOTA: countPM porneste de la -1 INTENTIONAT (spre deosebire de restul, care pornesc de la 0).
-// La PRIMUL ciclu de 5 min dupa boot, daca s-a apucat doar o singura citire valida, countPM
-// ajunge la 0 -> conditia "countPM > 0" de la salvare e falsa -> punctul se salveaza ca gol (-999)
-// in loc de o "medie" formata dintr-o singura proba nereprezentativa imediat dupa warmup.
-// Dupa primul ciclu, reset-ul de la finalul salvarii il pune pe 0, deci efectul e doar la pornire.
-int countPM=-1, countCO2=0, countClima=0, countVOC=0, countNOx=0;
+// Prima fereastra pastreaza regula intentionata: o singura proba produce gol.
+// Contorul real evita impartirea primului lot la un numar de probe prea mic.
+bool primaFereastraPm = true;
+int countPM=0, countCO2=0, countTemp=0, countUmid=0, countVOC=0, countNOx=0;
+
+// Pastram separat indisponibilitatea de o valoare fizica egala cu zero.
+void invalideazaMasurari() {
+  validitateSenzor = {};
+  areDate = false;
+  pm1=pm25=pm4=pm10=-1;
+  co2=65535; voc=nox=65535;
+  temp=umiditate=-999;
+}
 
 String istPM25="", istCO2="", istVOC="", istNOx="", istTemp="", istUmid="";
 String istPM1="", istPM4="", istPM10="";
 String jurnalErori = "";
+bool jurnalRecuperat = false, jurnalModificat = false, jurnalIncercat = false;
+uint32_t tUltimaIncercareJurnal = 0;
 bool eroriCuratateLaOra=false, wifiAvertizat=false, senzorAvertizat=false;
 // Stare comunicare senzor (cu debounce): senzorEsuatComm devine true dupa cateva erori
 // consecutive (~15s fara raspuns) -> LED mov + ecran de eroare. senzorEroareAfisata retine
@@ -309,18 +371,7 @@ int  senzorEroriConsecutive = 0;
 bool senzorEsuatComm     = false;
 bool senzorEroareAfisata = false;
 
-void logSystem(String mesaj) {
-  #ifdef DEBUG_SERIAL
-  if (Serial) Serial.println(mesaj);
-  #endif
-  if (!firebaseGata) return;
-  time_t now; time(&now);
-  String tsStr  = (now < 1000000000) ? "999999999" : String(now);
-  String intrare = tsStr + "#" + mesaj;
-
-  if (jurnalErori != "") jurnalErori += "|";
-  jurnalErori += intrare;
-
+void limiteazaJurnal() {
   int nrErori = 0;
   for (int i = 0; i < (int)jurnalErori.length(); i++) { if (jurnalErori[i] == '|') nrErori++; }
   while (nrErori >= 30) {
@@ -328,7 +379,61 @@ void logSystem(String mesaj) {
     if (idx != -1) jurnalErori.remove(0, idx + 1);
     nrErori--;
   }
-  Firebase.RTDB.setStringAsync(&fbdoScriere, "/SenzoriAer/ErrorLog", jurnalErori);
+}
+
+void captureazaEtapaAnterioaraReset() {
+  etapaAnterioaraReset = "";
+  const auto motiv = esp_reset_reason();
+  if (motiv == ESP_RST_POWERON || motiv == ESP_RST_BROWNOUT) return;
+  // RTC_NOINIT nu garanteaza continut valid; citim numai un identificator terminat.
+  size_t n = 0;
+  while (n < sizeof(rtc_last_state) && rtc_last_state[n] != '\0') {
+    const char c = rtc_last_state[n];
+    if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+          (c >= '0' && c <= '9') || c == '_')) break;
+    ++n;
+  }
+  if (n > 0 && n < sizeof(rtc_last_state) && rtc_last_state[n] == '\0')
+    etapaAnterioaraReset = String(rtc_last_state);
+  else strcpy(rtc_last_state, "Etapa_Necunoscuta");
+}
+
+void logSystem(String mesaj) {
+  #ifdef DEBUG_SERIAL
+  if (Serial) Serial.println(mesaj);
+  #endif
+  time_t now; time(&now);
+  String tsStr = (now < 1000000000) ? "999999999" : String(now);
+  if (jurnalErori != "") jurnalErori += "|";
+  jurnalErori += tsStr + "#" + mesaj;
+  limiteazaJurnal();
+  // Evenimentele de boot/offline raman in RAM pana la import si confirmarea scrierii.
+  jurnalModificat = true;
+}
+
+void recupereazaJurnal(const String& cloud) {
+  if (jurnalRecuperat) return;
+  if (cloud != "") jurnalErori = cloud + (jurnalErori != "" ? "|" + jurnalErori : "");
+  limiteazaJurnal();
+  jurnalRecuperat = true;
+  // Bootul nu depinde de finalizarea celor noua serii de istoric.
+  if (!bootLogSent) {
+    logSystem("Sistem Repornit: " + motivRestart);
+    bootLogSent = true;
+  }
+}
+
+void trimiteJurnalDacaNecesar() {
+  if (!jurnalRecuperat || !jurnalModificat || !firebaseGata ||
+      WiFi.status() != WL_CONNECTED || !Firebase.ready()) return;
+  const uint32_t acum = millis();
+  if (jurnalIncercat && uint32_t(acum - tUltimaIncercareJurnal) < 10000UL) return;
+  jurnalIncercat = true;
+  tUltimaIncercareJurnal = acum;
+  updateState("Trimitere_Jurnal_FB");
+  if (Firebase.RTDB.setString(&fbdoScriere, "/SenzoriAer/ErrorLog", jurnalErori))
+    jurnalModificat = false;
+  updateState("Running_Loop");
 }
 
 void adaugaInIstoric(String &istoricActual, String valoareNoua, int puncteLipsa) {
@@ -355,9 +460,11 @@ void salveazaPunctIstoric(int puncteLipsa) {
   String strPM25="-999", strCO2="-999", strVOC="-999", strNOx="-999";
   String strTemp="-999", strUmid="-999", strPM1="-999", strPM4="-999", strPM10="-999";
 
-  if (countPM   > 0) { strPM1=String(sumPM1/countPM,1); strPM25=String(sumPM25/countPM,1); strPM4=String(sumPM4/countPM,1); strPM10=String(sumPM10/countPM,1); }
+  const int divizor = divizorPm(countPM, primaFereastraPm);
+  if (divizor > 0) { strPM1=String(sumPM1/divizor,1); strPM25=String(sumPM25/divizor,1); strPM4=String(sumPM4/divizor,1); strPM10=String(sumPM10/divizor,1); }
   if (countCO2  > 0) { strCO2=String((int)round((float)sumCO2/countCO2)); }
-  if (countClima> 0) { strTemp=String(sumTemp/countClima,1); strUmid=String(sumUmid/countClima,1); }
+  if (countTemp > 0) strTemp=String(sumTemp/countTemp,1);
+  if (countUmid > 0) strUmid=String(sumUmid/countUmid,1);
   if (countVOC  > 0) { strVOC=String((int)round(sumVOC/countVOC)); }
   if (countNOx  > 0) { strNOx=String((int)round(sumNOx/countNOx)); }
 
@@ -368,11 +475,31 @@ void salveazaPunctIstoric(int puncteLipsa) {
   adaugaInIstoric(istPM10, strPM10, puncteLipsa);
 
   sumPM1=0; sumPM25=0; sumPM4=0; sumPM10=0; sumTemp=0; sumUmid=0; sumVOC=0; sumNOx=0; sumCO2=0;
-  countPM=0; countCO2=0; countClima=0; countVOC=0; countNOx=0;
+  countPM=0; countCO2=0; countTemp=0; countUmid=0; countVOC=0; countNOx=0;
+  primaFereastraPm = false;
 }
 
 // Lipeste istoricul local (acumulat cat timp placa a fost offline de la boot) dupa
 // cel din cloud, cu "gapSlots" goluri -999 intre ele; pastreaza cele mai noi 288 puncte.
+String combinaArhivaZi(String existenta, String recuperata) {
+  existenta = extrageArhivaIeri(existenta, 0);
+  recuperata = extrageArhivaIeri(recuperata, 0);
+  String rezultat;
+  int vechi = 0, nou = 0;
+  for (int i=0; i<288; ++i) {
+    int sfVechi = existenta.indexOf(',', vechi);
+    int sfNou = recuperata.indexOf(',', nou);
+    if (sfVechi < 0) sfVechi = existenta.length();
+    if (sfNou < 0) sfNou = recuperata.length();
+    String a = existenta.substring(vechi, sfVechi);
+    String b = recuperata.substring(nou, sfNou);
+    if (i) rezultat += ",";
+    rezultat += (a == "" || a == "-999" || a == "nan" || a == "NaN") ? b : a;
+    vechi = sfVechi + 1; nou = sfNou + 1;
+  }
+  return rezultat;
+}
+
 String mergeIstoricCloudLocal(String cloud, const String &local, int gapSlots) {
   if (local.length() == 0) return cloud;
   String rezultat = cloud;
@@ -401,17 +528,23 @@ String mergeIstoricCloudLocal(String cloud, const String &local, int gapSlots) {
 // =========================================================================
 struct EvenimentSetari { char path[48]; char data[1024]; };
 QueueHandle_t coadaSetari = NULL;
+bool necesitaReconciliere = false;
+bool necesitaSetariVentilator = false;  // Folosit numai din loop; stream-ul copiaza intentia in coada.
 
 void streamCallback(FirebaseStream data) {
   if (coadaSetari == NULL) return;
   EvenimentSetari ev;
+  if (data.dataPath().length() >= sizeof(ev.path) || data.payload().length() >= sizeof(ev.data)) {
+    __atomic_store_n(&necesitaReconciliere, true, __ATOMIC_RELAXED);
+    return;
+  }
   strncpy(ev.path, data.dataPath().c_str(), sizeof(ev.path) - 1);
   ev.path[sizeof(ev.path) - 1] = '\0';
   strncpy(ev.data, data.payload().c_str(), sizeof(ev.data) - 1);
   ev.data[sizeof(ev.data) - 1] = '\0';
-  // daca e plina coada, evenimentul se pierde — snapshot-ul complet trimis de server
-  // la urmatoarea (re)conectare a stream-ului readuce oricum toate valorile
-  xQueueSend(coadaSetari, &ev, 0);
+  // La depasirea cozii cerem un snapshot complet din bucla principala.
+  if (xQueueSend(coadaSetari, &ev, 0) != pdTRUE)
+    __atomic_store_n(&necesitaReconciliere, true, __ATOMIC_RELAXED);
 }
 
 void streamTimeoutCallback(bool timeout) {
@@ -460,10 +593,10 @@ int trimiteAlertaFCM(String titlu, String mesaj) {
 }
 
 void verificaAlertePoluare(unsigned long t) {
-  if (!fcmActiv || (t - tSenzorStart < 60000UL)) return;   // nimic in warmup
+  if (!fcmActiv || (varstaSenzor(t) < 60000UL)) return;   // nimic in warmup
   unsigned long cooldown = (unsigned long)notifFreqMin * 60000UL;
 
-  if (notifPraf && pm25 >= alertPm &&
+  if (notifPraf && validitateSenzor.pm && pm25 >= alertPm &&
       (tUltimaAlertaPraf == 0 || t - tUltimaAlertaPraf >= cooldown)) {
     if (trimiteAlertaFCM("Alerta Praf", "Nivel ridicat de PM2.5: " + String(pm25, 1) + " ug/m3!") >= 0)
       tUltimaAlertaPraf = t;
@@ -471,9 +604,9 @@ void verificaAlertePoluare(unsigned long t) {
 
   if (notifGaze && (tUltimaAlertaGaze == 0 || t - tUltimaAlertaGaze >= cooldown)) {
     String motiv = "";
-    if      (co2 >= alertCo2 && co2 != 0 && co2 != 65535) motiv = "CO2 a ajuns la " + String(co2) + " ppm!";
-    else if (voc >= alertVoc && voc <= 500)               motiv = "VOC a ajuns la nivelul " + String((int)voc) + "!";
-    else if (nox >= alertNox && nox <= 500)               motiv = "NOx a ajuns la nivelul " + String((int)nox) + "!";
+    if      (validitateSenzor.co2 && co2 >= alertCo2 && co2 != 0 && co2 != 65535) motiv = "CO2 a ajuns la " + String(co2) + " ppm!";
+    else if (validitateSenzor.voc && voc >= alertVoc && voc <= 500)               motiv = "VOC a ajuns la nivelul " + String((int)voc) + "!";
+    else if (validitateSenzor.nox && nox >= alertNox && nox <= 500)               motiv = "NOx a ajuns la nivelul " + String((int)nox) + "!";
     if (motiv != "" && trimiteAlertaFCM("Alerta Aerisire", motiv) >= 0) tUltimaAlertaGaze = t;
   }
 }
@@ -482,31 +615,186 @@ void verificaAlertePoluare(unsigned long t) {
 // APLICAREA SETARILOR + COMENZILE VENITE DIN APLICATIE
 // =========================================================================
 bool offsetFortatLaBoot = false;
+float offsetSolicitatTemp = 0;
+bool offsetIncercat = false, offsetAvertizat = false;
+uint32_t tUltimaIncercareOffset = 0;
 
 void aplicaOffsetTemp(float newOffset) {
-  if (!offsetFortatLaBoot || fabs(newOffset - offsetTemperatura) > 0.05) {
-    offsetTemperatura = newOffset;
-    storace.putFloat("tempOffset", offsetTemperatura);
-    sen66.setTemperatureOffsetParameters((int16_t)(offsetTemperatura * 200), 0, 0, 0);
-    unsigned long tWait = millis();
-    while (millis() - tWait < 20) { yield(); }
-    if (offsetFortatLaBoot) logSystem("Offset Termic modificat: " + String(offsetTemperatura) + " C");
-    else {
-      #ifdef DEBUG_SERIAL
-      if (Serial) Serial.println("Offset sincronizat la boot.");
-      #endif
+  if (!isfinite(newOffset) || newOffset < -3.0f || newOffset > 3.0f) return;
+  offsetSolicitatTemp = newOffset;
+  if (offsetFortatLaBoot && fabs(newOffset - offsetTemperatura) <= 0.05) return;
+  const uint32_t acum = millis();
+  if (offsetIncercat && uint32_t(acum - tUltimaIncercareOffset) < 10000UL) return;
+  offsetIncercat = true;
+  tUltimaIncercareOffset = acum;
+  const int16_t eroare = sen66.setTemperatureOffsetParameters((int16_t)(newOffset * 200), 0, 0, 0);
+  unsigned long tWait = millis();
+  while (millis() - tWait < 20) { yield(); }
+  if (eroare != 0) {
+    if (!offsetAvertizat) {
+      logSystem("Aplicare offset termic esuata: Cod " + String(eroare));
+      offsetAvertizat = true;
     }
-    offsetFortatLaBoot = true;
+    return;
   }
+  const bool modificat = fabs(newOffset - offsetTemperatura) > 0.05;
+  // RAM/NVS descriu numai valoarea confirmata de comanda I2C; cererea ramane pentru retry.
+  offsetTemperatura = newOffset;
+  if (modificat) storace.putFloat("tempOffset", offsetTemperatura);
+  if (modificat || offsetAvertizat)
+    logSystem("Offset Termic modificat: " + String(offsetTemperatura) + " C");
+  offsetAvertizat = false;
+  offsetFortatLaBoot = true;
+}
+
+String mesajDiagnostic(const String& mesaj, bool& limitat) {
+  // Lista explicita impiedica exportul SSID-ului, erorilor SDK si textelor cloud arbitrare.
+  const char* mesajeSigure[] = {
+    "Curatare SEN66 Inceputa...", "Curatare SEN66 Finalizata.",
+    "Comanda: Stergere calibrare VOC si Restart",
+    "Calibrare CO2 respinsa: actualizati aplicatia si confirmati din nou.",
+    "Calibrare CO2 respinsa: termen expirat sau ceas nesincronizat.",
+    "Calibrare CO2 respinsa: termen expirat inainte de FRC.",
+    "Comunicare SEN66 restabilita",
+    "WDT: Senzorul SEN66 a blocat citirile de 15s. Reinitializare...",
+    "Calibrare VOC extrasa si salvata.", "Eroare la extragerea VOC State.",
+    "Night Mode pornit (programat)", "Night Mode oprit (programat)",
+    "Firebase restabilit: publicare confirmata",
+    "Timer pornit", "Timer expirat: revenire AUTO", "Timer anulat: revenire AUTO"
+  };
+  for (const char* sigur : mesajeSigure) if (mesaj == sigur) return mesaj;
+  const char* prefixe[] = {"Sistem Repornit: ", "WiFi restabilit pe: ",
+    "Eroare buffer Live FB: ", "Aplicare offset termic esuata: Cod ",
+    "Offset Termic modificat: ", "FRC CO2 reusit. Corectie aplicata: ",
+    "FRC CO2 esuat (cod ", "Firebase fara confirmare 120s; ",
+    "Eroare citire SEN66: Cod ", "Arhiva confirmata: "};
+  const char* descrieri[] = {"Sistem Repornit (motiv in raport)", "WiFi restabilit (SSID omis)",
+    "Eroare buffer Live FB (detalii omise)", "Aplicare offset termic esuata (detalii omise)",
+    "Offset Termic modificat (detalii omise)", "FRC CO2 reusit (detalii omise)",
+    "FRC CO2 esuat (detalii omise)", "Firebase fara confirmare 120s; refacere conexiune",
+    "Eroare citire SEN66 (detalii omise)", "Arhiva confirmata (data in reperul arhivei)"};
+  limitat = true;
+  for (size_t i = 0; i < sizeof(prefixe) / sizeof(prefixe[0]); ++i)
+    if (mesaj.startsWith(prefixe[i])) return descrieri[i];
+  return "Eveniment omis (text neclasificat)";
+}
+
+String jurnalDiagnostic(bool& limitat) {
+  limitat = false;
+  int evenimente = jurnalErori.length() ? 1 : 0;
+  for (unsigned int i = 0; i < jurnalErori.length(); ++i) if (jurnalErori[i] == '|') ++evenimente;
+  int start = 0;
+  while (evenimente > 10) { start = jurnalErori.indexOf('|', start) + 1; --evenimente; limitat = true; }
+  String rezultat;
+  while (start < (int)jurnalErori.length()) {
+    int end = jurnalErori.indexOf('|', start);
+    if (end < 0) end = jurnalErori.length();
+    const int capatLimitat = end - start > 160 ? start + 160 : end;
+    if (capatLimitat != end) limitat = true;
+    String eveniment = jurnalErori.substring(start, capatLimitat);
+    const int hash = eveniment.indexOf('#');
+    String stamp = hash > 0 && hash <= 11 ? eveniment.substring(0, hash) : "";
+    for (unsigned int i = 0; i < stamp.length(); ++i)
+      if (stamp[i] < '0' || stamp[i] > '9') { stamp = ""; break; }
+    if (stamp == "") { stamp = "999999999"; limitat = true; }
+    String mesaj = hash >= 0 ? eveniment.substring(hash + 1) : eveniment;
+    eveniment = stamp + "#" + mesajDiagnostic(mesaj, limitat);
+    if (eveniment.length() > 160) { eveniment = eveniment.substring(0, 160); limitat = true; }
+    if (rezultat.length()) rezultat += "|";
+    rezultat += eveniment;
+    start = end + 1;
+  }
+  return rezultat;
+}
+
+void adaugaStareTimer(FirebaseJson& json, const String& prefix, bool timestamp) {
+  const CerereTimer& cerere = stareTimer.cerere();
+  json.set(prefix + "/schema", 1);
+  json.set(prefix + "/boot_id", stareTimer.bootId());
+  json.set(prefix + "/id", cerere.id);
+  json.set(prefix + "/activ", stareTimer.activ());
+  json.set(prefix + "/creat_la_ms", cerere.creatLaMs);
+  json.set(prefix + "/sfarsit_ms", cerere.sfarsitMs);
+  json.set(prefix + "/viteza_pct", cerere.vitezaPct);
+  json.set(prefix + "/ramas_sec", stareTimer.ramasSec(esp_timer_get_time() / 1000ULL));
+  if (timestamp) json.set(prefix + "/raportat_la/.sv", "timestamp");
+}
+
+void adaugaDiagnostic(FirebaseJson& json) {
+  const uint64_t acumMs = esp_timer_get_time() / 1000ULL;
+  uint64_t varstaAckMs = 0;
+  const bool wifi = WiFi.status() == WL_CONNECTED;
+  const float temperaturaMcu = temperatureRead();
+  json.set("Diagnostic/schema", 1);
+  json.set("Diagnostic/raportat_la/.sv", "timestamp");
+  json.set("Diagnostic/firmware_versiune", VERSIUNE_FIRMWARE);
+  json.set("Diagnostic/firmware_build", BUILD_FIRMWARE);
+  json.set("Diagnostic/uptime_sec", acumMs / 1000ULL);
+  json.set("Diagnostic/reset_motiv", motivRestart);
+  json.set("Diagnostic/etapa_curenta", rtc_last_state);
+  if (etapaAnterioaraReset.length()) json.set("Diagnostic/etapa_anterioara_reset", etapaAnterioaraReset);
+  else json.set("Diagnostic/etapa_anterioara_reset");
+  json.set("Diagnostic/wifi_conectat", wifi);
+  if (wifi) json.set("Diagnostic/wifi_rssi_dbm", WiFi.RSSI()); else json.set("Diagnostic/wifi_rssi_dbm");
+  json.set("Diagnostic/ntp_sincronizat", ceasValid());
+  json.set("Diagnostic/firebase_initializat", firebaseGata);
+  // Varsta ACK-ului anterior; publicarea acestui raport inca nu a fost confirmata.
+  if (stareCloud.varstaConfirmare(acumMs, varstaAckMs)) json.set("Diagnostic/cloud_ack_varsta_sec", varstaAckMs / 1000ULL);
+  else json.set("Diagnostic/cloud_ack_varsta_sec");
+  json.set("Diagnostic/heap_liber_bytes", ESP.getFreeHeap());
+  json.set("Diagnostic/heap_minim_bytes", ESP.getMinFreeHeap());
+  json.set("Diagnostic/psram_liber_bytes", ESP.getFreePsram());
+  if (isfinite(temperaturaMcu)) json.set("Diagnostic/temperatura_mcu_c", temperaturaMcu);
+  else json.set("Diagnostic/temperatura_mcu_c");
+  json.set("Diagnostic/senzor_comunicatie_ok", diagnosticAreCitireSenzor && senzorEroriConsecutive == 0 && !senzorEsuatComm);
+  json.set("Diagnostic/senzor_warmup_incheiat", warmupSenzorTerminat);
+  if (diagnosticAreCitireSenzor) json.set("Diagnostic/senzor_ultima_citire_varsta_ms", acumMs - diagnosticUltimaCitireMs);
+  else json.set("Diagnostic/senzor_ultima_citire_varsta_ms");
+  json.set("Diagnostic/canal_pm_valid", validitateSenzor.pm);
+  json.set("Diagnostic/canal_co2_valid", validitateSenzor.co2);
+  json.set("Diagnostic/canal_voc_valid", validitateSenzor.voc);
+  json.set("Diagnostic/canal_nox_valid", validitateSenzor.nox);
+  json.set("Diagnostic/canal_temperatura_valid", validitateSenzor.temperatura);
+  json.set("Diagnostic/canal_umiditate_valid", validitateSenzor.umiditate);
+  json.set("Diagnostic/fan_auto", isAutoMode);
+  json.set("Diagnostic/fan_cerut_pct", vitezaDinAplicatie);
+  json.set("Diagnostic/fan_tinta_pct", targetFanSpeed);
+  json.set("Diagnostic/fan_aplicat_pct", currentFanSpeed);
+  json.set("Diagnostic/rpm", rpmReal);
+  adaugaStareTimer(json, "Diagnostic/timer", false);
+  json.set("Diagnostic/offset_solicitat_c", offsetSolicitatTemp);
+  if (offsetFortatLaBoot) json.set("Diagnostic/offset_aplicat_c", offsetTemperatura);
+  else json.set("Diagnostic/offset_aplicat_c");
+  json.set("Diagnostic/night_auto", nmAuto);
+  json.set("Diagnostic/night_activ", nightModeApp);
+  json.set("Diagnostic/nm_start", nmStartMin);
+  json.set("Diagnostic/nm_end", nmEndMin);
+  json.set("Diagnostic/istoric_recuperat", istoricRecuperat);
+  json.set("Diagnostic/istoric_ultimul_punct", lastIstoricSaveTime);
+  json.set("Diagnostic/arhiva_reper_data", lastArchivedDateStr);
+  json.set("Diagnostic/arhiva_in_asteptare", arhivaDiagnosticInAsteptare);
+  json.set("Diagnostic/jurnal_recuperat", jurnalRecuperat);
+  json.set("Diagnostic/jurnal_nepublicat", jurnalModificat);
+  bool jurnalLimitat = false;
+  json.set("Diagnostic/jurnal", jurnalDiagnostic(jurnalLimitat));
+  json.set("Diagnostic/jurnal_limitat", jurnalLimitat);
+}
+
+// Recitim intentia curenta: un eveniment vechi din coada nu executa comanda de doua ori.
+bool consumaComanda(const char* nume) {
+  const String cale = String("/SenzoriAer/setari/") + nume;
+  if (!firebaseGata || WiFi.status() != WL_CONNECTED) return false;
+  if (!Firebase.RTDB.getBool(&fbdoCitire, cale) || !fbdoCitire.boolData()) return false;
+  return Firebase.RTDB.setBool(&fbdoScriere, cale, false);
 }
 
 void comandaRestart() {
-  Firebase.RTDB.setBool(&fbdoScriere, "/SenzoriAer/setari/restart", false);
+  if (!consumaComanda("restart")) return;
   delay(100); ESP.restart();
 }
 
 void comandaCuratare() {
-  Firebase.RTDB.setBool(&fbdoScriere, "/SenzoriAer/setari/curatare", false);
+  if (!consumaComanda("curatare")) return;
   tft.fillScreen(ST77XX_BLACK); tft.setCursor(30, 160); tft.setTextColor(ST77XX_ORANGE); tft.print("CURATARE SENZOR");
   logSystem("Curatare SEN66 Inceputa...");
   sen66.stopMeasurement();
@@ -527,16 +815,29 @@ void comandaCuratare() {
 // deci algoritmul VOC porneste de la zero — re-invatare 12-24h, conform Sensirion.
 // (Starea VOC e volatila in senzor; doar copia din NVS o facea persistenta.)
 void comandaResetVoc() {
-  Firebase.RTDB.setBool(&fbdoScriere, "/SenzoriAer/setari/reset_voc", false);
+  if (!consumaComanda("reset_voc")) return;
   tft.fillScreen(ST77XX_BLACK); tft.setCursor(30, 160); tft.setTextColor(ST77XX_RED); tft.print("RESET VOC");
   updateState("Reset_VOC");
   logSystem("Comanda: Stergere calibrare VOC si Restart");
   storace.remove("vocState");
 
-  // lasam task-ul async sa trimita logul inainte de restart
-  unsigned long tW = millis();
-  while (millis() - tW < 2000) { esp_task_wdt_reset(); yield(); }
+  // RAM dispare la restart: incercam o publicare confirmata, chiar dupa un ACK recent.
+  // Garda de import ramane activa, astfel nu suprascriem un jurnal inca necitit.
+  jurnalIncercat = false;
+  trimiteJurnalDacaNecesar();
   ESP.restart();
+}
+
+bool calibrareCo2InTermen(double expira) {
+  if (!ceasValid() || !isfinite(expira) || expira != floor(expira)) return false;
+  const double acum = static_cast<double>(time(nullptr));
+  return expira > acum && expira - acum <= 120.0;
+}
+
+// Aplicatiile vechi nu trimit termen; consumam intentia fara calibrare intarziata.
+void respingeCalibrareCo2Veche() {
+  if (consumaComanda("calibrare_co2"))
+    logSystem("Calibrare CO2 respinsa: actualizati aplicatia si confirmati din nou.");
 }
 
 // Calibrare fortata CO2 (FRC) la aer proaspat, conform datasheet SEN6x (cmd 0x6707):
@@ -547,7 +848,20 @@ void comandaResetVoc() {
 // aparatul la aer proaspat (~420 ppm) minim 3 minute inainte, altfel senzorul s-ar
 // calibra pe aerul viciat din camera.
 void comandaCalibrareCo2() {
-  Firebase.RTDB.setBool(&fbdoScriere, "/SenzoriAer/setari/calibrare_co2", false);
+  const char* cale = "/SenzoriAer/setari/calibrare_co2_expira";
+  if (!firebaseGata || WiFi.status() != WL_CONNECTED) return;
+  // Recitim termenul actual; un eveniment vechi nu poate reinnoi cererea consumata.
+  if (!Firebase.RTDB.getDouble(&fbdoCitire, cale)) return;
+  const String tip = fbdoCitire.dataType();
+  if (tip != "int" && tip != "float" && tip != "double") return;
+  const double expira = fbdoCitire.doubleData();
+  if (expira <= 0) return;
+  const bool inTermen = calibrareCo2InTermen(expira);
+  if (!Firebase.RTDB.setInt(&fbdoScriere, cale, 0)) return;
+  if (!inTermen || !calibrareCo2InTermen(expira)) {
+    logSystem("Calibrare CO2 respinsa: termen expirat sau ceas nesincronizat.");
+    return;
+  }
   tft.fillScreen(ST77XX_BLACK); tft.setCursor(30, 160); tft.setTextColor(ST77XX_ORANGE); tft.print("CALIBRARE CO2");
   updateState("Calibrare_CO2");
 
@@ -555,6 +869,13 @@ void comandaCalibrareCo2() {
   unsigned long tW = millis();
   while (millis() - tW < 600) { esp_task_wdt_reset(); yield(); }
 
+  // Inclusiv oprirea senzorului poate trece de termen; nu executam atunci FRC.
+  if (!calibrareCo2InTermen(expira)) {
+    sen66.startContinuousMeasurement();
+    logSystem("Calibrare CO2 respinsa: termen expirat inainte de FRC.");
+    forceFullRedraw = true;
+    return;
+  }
   uint16_t corectie = 0xFFFF;
   int16_t errFrc = sen66.performForcedCo2Recalibration(420, corectie);
   tW = millis();
@@ -572,67 +893,159 @@ void comandaCalibrareCo2() {
 }
 
 // Snapshot complet de setari (la conectarea stream-ului sau patch cu mai multe campuri).
-// Cheile lipsa raman neatinse (jsonData.success = false), deci merge si pe patch-uri partiale.
-void aplicaSetariJson(FirebaseJson &json) {
+// Folosim rezultatul fiecarui get(): biblioteca poate pastra jsonData la o cheie lipsa.
+// Astfel, patch-urile partiale nu copiaza valoarea precedenta peste alte setari/comenzi.
+int64_t timerAcumUnixMs() {
+  struct timeval acum;
+  gettimeofday(&acum, nullptr);
+  return static_cast<int64_t>(acum.tv_sec) * 1000 + acum.tv_usec / 1000;
+}
+
+void intretineTimer() {
+  if (stareTimer.expira(esp_timer_get_time() / 1000ULL)) {
+    vitezaBaza = 0;
+    logSystem("Timer expirat: revenire AUTO");
+  }
+  vitezaDinAplicatie = stareTimer.activ() ? stareTimer.viteza() : vitezaBaza;
+}
+
+bool citesteNumarTimer(FirebaseJson& json, const String& cale, int64_t& valoare) {
+  FirebaseJsonData data;
+  if (!json.get(data, cale) || (data.typeNum != FirebaseJson::JSON_INT &&
+      data.typeNum != FirebaseJson::JSON_FLOAT && data.typeNum != FirebaseJson::JSON_DOUBLE)) return false;
+  const double numar = data.doubleValue;
+  if (!isfinite(numar) || numar != floor(numar) || numar < 0 || numar > 9007199254740991.0) return false;
+  valoare = static_cast<int64_t>(numar);
+  return true;
+}
+
+void aplicaObiectTimer(FirebaseJson& json, const String& prefix) {
+  intretineTimer();
+  vitezaBaza = 0;  // Un timer invalid/vechi nu reactiveaza o treapta manuala anterioara.
+  CerereTimer cerere;
+  FirebaseJsonData data;
+  int64_t viteza = 0;
+  bool valid = json.get(data, prefix + "id") && data.typeNum == FirebaseJson::JSON_STRING &&
+               StareTimer::hexValid(data.stringValue.c_str(), 32);
+  if (valid) memcpy(cerere.id, data.stringValue.c_str(), sizeof(cerere.id));
+  valid = valid && json.get(data, prefix + "boot_id") && data.typeNum == FirebaseJson::JSON_STRING &&
+          StareTimer::hexValid(data.stringValue.c_str(), 16);
+  if (valid) memcpy(cerere.bootId, data.stringValue.c_str(), sizeof(cerere.bootId));
+  valid = valid && citesteNumarTimer(json, prefix + "creat_la_ms", cerere.creatLaMs) &&
+          citesteNumarTimer(json, prefix + "sfarsit_ms", cerere.sfarsitMs) &&
+          citesteNumarTimer(json, prefix + "viteza_pct", viteza) && viteza >= 1 && viteza <= 100;
+  cerere.vitezaPct = static_cast<int>(viteza);
+  const StareTimer::Rezultat rezultat = valid
+      ? stareTimer.aplica(cerere, ceasValid(), timerAcumUnixMs(), esp_timer_get_time() / 1000ULL)
+      : StareTimer::RESPINS;
+  if (rezultat == StareTimer::PORNIT) logSystem("Timer pornit");
+  if (rezultat == StareTimer::RESPINS && stareTimer.anuleaza()) logSystem("Timer anulat: revenire AUTO");
+  intretineTimer();
+}
+
+void aplicaSetariTimer(FirebaseJson& json) {
+  FirebaseJsonData data;
+  const bool areViteza = json.get(data, "speed");
+  const int viteza = areViteza ? constrain(data.intValue, 0, 100) : vitezaBaza;
+  const bool areTimer = json.get(data, "timer");
+  if (areTimer && data.typeNum == FirebaseJson::JSON_OBJECT) {
+    aplicaObiectTimer(json, "timer/");
+    return;
+  }
+  if (areTimer) {
+    // false este anularea explicita. null/tip gresit aleg AUTO in siguranta.
+    const bool anulare = data.typeNum == FirebaseJson::JSON_BOOL && !data.boolValue;
+    if (stareTimer.anuleaza()) logSystem("Timer anulat: revenire AUTO");
+    vitezaBaza = anulare && areViteza ? viteza : 0;
+  } else if (areViteza) {
+    // Clientii vechi raman compatibili; o schimbare speed singura este manual/AUTO.
+    if (stareTimer.anuleaza()) logSystem("Timer anulat: revenire AUTO");
+    vitezaBaza = viteza;
+  } else {
+    // PATCH poate contine chei multipath literale, nu un obiect timer complet.
+    const size_t total = json.iteratorBegin();
+    for (size_t i = 0; i < total; ++i) {
+      int tip; String cheie, valoare;
+      json.iteratorGet(i, tip, cheie, valoare);
+      if (cheie.startsWith("timer/")) necesitaSetariVentilator = true;
+    }
+    json.iteratorEnd();
+  }
+  intretineTimer();
+}
+
+bool aplicaTimerIndividual(const String& cale, const String& val) {
+  (void)val;
+  if (cale == "/timer" || cale.startsWith("/timer/") || cale == "/speed") {
+    // Evenimentele pot ramane in coada dupa un poll mai nou. Aplicam doar copia
+    // completa recitita, niciodata o anulare/treapta veche din stream.
+    necesitaSetariVentilator = true;
+    return true;
+  }
+  return false;
+}
+
+void aplicaSetariJson(FirebaseJson &json, bool permiteVentilator) {
   FirebaseJsonData jsonData;
 
-  json.get(jsonData, "night_mode");
-  if (jsonData.success) nightModeApp = jsonData.boolValue;
+  if (json.get(jsonData, "night_mode")) nightModePrimit = jsonData.boolValue;
 
-  json.get(jsonData, "live_mode");
-  if (jsonData.success) modLiveRapid = jsonData.boolValue;
+  if (json.get(jsonData, "live_mode")) modLiveRapid = jsonData.boolValue;
 
-  json.get(jsonData, "luminozitate");
-  if (jsonData.success) luminozitateEcran = constrain(jsonData.intValue, 0, 100);
+  if (json.get(jsonData, "luminozitate")) luminozitateEcran = constrain(jsonData.intValue, 0, 100);
 
-  json.get(jsonData, "luminozitate_led");
-  if (jsonData.success) luminozitateLed = constrain(jsonData.intValue, 0, 255);
+  if (json.get(jsonData, "luminozitate_led")) luminozitateLed = constrain(jsonData.intValue, 0, 255);
 
-  json.get(jsonData, "speed");
-  if (jsonData.success) vitezaDinAplicatie = jsonData.intValue;
+  if (permiteVentilator) aplicaSetariTimer(json);
+  else necesitaSetariVentilator = true;
 
-  json.get(jsonData, "temp_offset");
-  if (jsonData.success) aplicaOffsetTemp(jsonData.floatValue);
+  if (json.get(jsonData, "temp_offset") &&
+      (jsonData.typeNum == FirebaseJson::JSON_INT || jsonData.typeNum == FirebaseJson::JSON_FLOAT ||
+       jsonData.typeNum == FirebaseJson::JSON_DOUBLE)) aplicaOffsetTemp(jsonData.floatValue);
 
   // praguri + comportament alerte push (FCM)
-  json.get(jsonData, "alert_pm");       if (jsonData.success) alertPm  = jsonData.floatValue;
-  json.get(jsonData, "alert_co2");      if (jsonData.success) alertCo2 = jsonData.intValue;
-  json.get(jsonData, "alert_voc");      if (jsonData.success) alertVoc = jsonData.floatValue;
-  json.get(jsonData, "alert_nox");      if (jsonData.success) alertNox = jsonData.floatValue;
-  json.get(jsonData, "notif_freq_min"); if (jsonData.success && jsonData.intValue >= 1) notifFreqMin = jsonData.intValue;
-  json.get(jsonData, "notif_praf");     if (jsonData.success) notifPraf = jsonData.boolValue;
-  json.get(jsonData, "notif_gaze");     if (jsonData.success) notifGaze = jsonData.boolValue;
+  if (json.get(jsonData, "alert_pm"))       alertPm  = jsonData.floatValue;
+  if (json.get(jsonData, "alert_co2"))      alertCo2 = jsonData.intValue;
+  if (json.get(jsonData, "alert_voc"))      alertVoc = jsonData.floatValue;
+  if (json.get(jsonData, "alert_nox"))      alertNox = jsonData.floatValue;
+  if (json.get(jsonData, "notif_freq_min") && jsonData.intValue >= 1) notifFreqMin = jsonData.intValue;
+  if (json.get(jsonData, "notif_praf"))     notifPraf = jsonData.boolValue;
+  if (json.get(jsonData, "notif_gaze"))     notifGaze = jsonData.boolValue;
 
   // fereastra Night Mode programata (aplicata de placa, nu de telefon)
-  json.get(jsonData, "nm_auto");  if (jsonData.success) nmAuto = jsonData.boolValue;
-  json.get(jsonData, "nm_start"); if (jsonData.success) nmStartMin = jsonData.intValue;
-  json.get(jsonData, "nm_end");   if (jsonData.success) nmEndMin = jsonData.intValue;
-  tAntNmCheck = 0;   // re-evalueaza fereastra Night Mode imediat dupa sincronizarea setarilor
+  if (json.get(jsonData, "nm_auto"))  nmAuto = jsonData.boolValue;
+  if (json.get(jsonData, "nm_start")) nmStartMin = jsonData.intValue;
+  if (json.get(jsonData, "nm_end"))   nmEndMin = jsonData.intValue;
 
   // comenzile raman la final (pot bloca bucla sau pot restarta placa)
-  json.get(jsonData, "reset_voc");
-  if (jsonData.success && jsonData.boolValue == true) comandaResetVoc();
-
-  json.get(jsonData, "calibrare_co2");
-  if (jsonData.success && jsonData.boolValue == true) comandaCalibrareCo2();
-
-  json.get(jsonData, "curatare");
-  if (jsonData.success && jsonData.boolValue == true) comandaCuratare();
-
-  json.get(jsonData, "restart");
-  if (jsonData.success && jsonData.boolValue == true) comandaRestart();
+  // Copiem toate intentiile inainte de recitire: json poate apartine lui fbdoCitire.
+  const bool cereResetVoc = json.get(jsonData, "reset_voc") && jsonData.boolValue;
+  const bool cereCalibrareVeche = json.get(jsonData, "calibrare_co2") && jsonData.boolValue;
+  const bool cereCalibrare = json.get(jsonData, "calibrare_co2_expira") && jsonData.floatValue > 0;
+  const bool cereCuratare = json.get(jsonData, "curatare") && jsonData.boolValue;
+  const bool cereRestart = json.get(jsonData, "restart") && jsonData.boolValue;
+  if (cereResetVoc) comandaResetVoc();
+  if (cereCalibrareVeche) respingeCalibrareCo2Veche();
+  if (cereCalibrare) comandaCalibrareCo2();
+  if (cereCuratare) comandaCuratare();
+  if (cereRestart) comandaRestart();
 }
 
 // Un singur camp s-a schimbat (ex. aplicatia a miscat sliderul de viteza) — stream-ul
 // trimite doar calea ("/speed") si valoarea bruta, nu tot JSON-ul.
 void aplicaSetareSingura(const String &cale, const String &val) {
+  if (aplicaTimerIndividual(cale, val)) return;
   if (val == "null") return;
-  if      (cale == "/night_mode")       nightModeApp = (val == "true");
+  if      (cale == "/night_mode")       nightModePrimit = (val == "true");
   else if (cale == "/live_mode")        modLiveRapid = (val == "true");
-  else if (cale == "/speed")            vitezaDinAplicatie = val.toInt();
   else if (cale == "/luminozitate")     luminozitateEcran  = constrain(val.toInt(), 0, 100);
   else if (cale == "/luminozitate_led") luminozitateLed    = constrain(val.toInt(), 0, 255);
-  else if (cale == "/temp_offset")      aplicaOffsetTemp(val.toFloat());
+  else if (cale == "/temp_offset") {
+    // toFloat() transforma si textul invalid in zero; acceptam numai numere complete.
+    char* sfarsit = nullptr;
+    const float offset = strtof(val.c_str(), &sfarsit);
+    if (sfarsit != val.c_str() && *sfarsit == '\0') aplicaOffsetTemp(offset);
+  }
   else if (cale == "/alert_pm")         alertPm  = val.toFloat();
   else if (cale == "/alert_co2")        alertCo2 = val.toInt();
   else if (cale == "/alert_voc")        alertVoc = val.toFloat();
@@ -640,11 +1053,12 @@ void aplicaSetareSingura(const String &cale, const String &val) {
   else if (cale == "/notif_freq_min")   { int v = val.toInt(); if (v >= 1) notifFreqMin = v; }
   else if (cale == "/notif_praf")       notifPraf = (val == "true");
   else if (cale == "/notif_gaze")       notifGaze = (val == "true");
-  else if (cale == "/nm_auto")          { nmAuto = (val == "true"); tAntNmCheck = 0; }
-  else if (cale == "/nm_start")         { nmStartMin = val.toInt(); tAntNmCheck = 0; }
-  else if (cale == "/nm_end")           { nmEndMin = val.toInt(); tAntNmCheck = 0; }
+  else if (cale == "/nm_auto")          nmAuto = (val == "true");
+  else if (cale == "/nm_start")         nmStartMin = val.toInt();
+  else if (cale == "/nm_end")           nmEndMin = val.toInt();
   else if (cale == "/reset_voc")        { if (val == "true") comandaResetVoc(); }
-  else if (cale == "/calibrare_co2")    { if (val == "true") comandaCalibrareCo2(); }
+  else if (cale == "/calibrare_co2")    { if (val == "true") respingeCalibrareCo2Veche(); }
+  else if (cale == "/calibrare_co2_expira") { if (val.toFloat() > 0) comandaCalibrareCo2(); }
   else if (cale == "/curatare")         { if (val == "true") comandaCuratare(); }
   else if (cale == "/restart")          { if (val == "true") comandaRestart(); }
 }
@@ -899,9 +1313,9 @@ void deseneazaDashboard() {
   }
 
   // ---- CO2 ----
-  if (co2 != (uint16_t)old_co2) {
-    String vStr = (co2 == 0 || co2 == 65535) ? "Init" : String(co2);
-    drawUpdatingTextCentered(vStr, 80, 52, &FreeSansBold24pt7b, getCo2Color(co2),
+  if ((int)co2 != old_co2) {
+    String vStr = !validitateSenzor.co2 ? "Init" : String(co2);
+    drawUpdatingTextCentered(vStr, 80, 52, &FreeSansBold24pt7b, !validitateSenzor.co2 ? ST77XX_WHITE : getCo2Color(co2),
                              bx_co2, by_co2, bw_co2, bh_co2);
     updateCursor(12, 68, 137, co2, 400, 2000, cur_co2);
     old_co2 = co2;
@@ -910,8 +1324,8 @@ void deseneazaDashboard() {
   // ---- PM2.5 ----
   float disp_pm25 = round(pm25 * 10.0) / 10.0;
   if (disp_pm25 != old_pm25) {
-    String vStr = (disp_pm25 < 0.0 && !areDate) ? "Init" : String(disp_pm25, 1);
-    drawUpdatingTextCentered(vStr, 239, 52, &FreeSansBold24pt7b, getPmColor(disp_pm25),
+    String vStr = !validitateSenzor.pm ? "Init" : String(disp_pm25, 1);
+    drawUpdatingTextCentered(vStr, 239, 52, &FreeSansBold24pt7b, !validitateSenzor.pm ? ST77XX_WHITE : getPmColor(disp_pm25),
                              bx_pm, by_pm, bw_pm, bh_pm);
     updateCursor(171, 68, 137, disp_pm25, 0, 50, cur_pm);
     old_pm25 = disp_pm25;
@@ -920,8 +1334,8 @@ void deseneazaDashboard() {
   // ---- VOC ----
   int disp_voc = (int)voc;
   if (disp_voc != old_voc) {
-    String vStr = (disp_voc > 500) ? "Init" : String(disp_voc);
-    drawUpdatingTextCentered(vStr, 44, 138, &FreeSansBold18pt7b, getVocColor(disp_voc),
+    String vStr = !validitateSenzor.voc ? "Init" : String(disp_voc);
+    drawUpdatingTextCentered(vStr, 44, 138, &FreeSansBold18pt7b, !validitateSenzor.voc ? ST77XX_WHITE : getVocColor(disp_voc),
                              bx_voc, by_voc, bw_voc, bh_voc);
     updateCursor(12, 150, 65, disp_voc, 1, 500, cur_voc);
     old_voc = disp_voc;
@@ -930,8 +1344,8 @@ void deseneazaDashboard() {
   // ---- NOx ----
   int disp_nox = (int)nox;
   if (disp_nox != old_nox) {
-    String vStr = (disp_nox > 500) ? "Init" : String(disp_nox);
-    drawUpdatingTextCentered(vStr, 116, 138, &FreeSansBold18pt7b, getNoxColor(disp_nox),
+    String vStr = !validitateSenzor.nox ? "Init" : String(disp_nox);
+    drawUpdatingTextCentered(vStr, 116, 138, &FreeSansBold18pt7b, !validitateSenzor.nox ? ST77XX_WHITE : getNoxColor(disp_nox),
                              bx_nox, by_nox, bw_nox, bh_nox);
     updateCursor(84, 150, 65, disp_nox, 1, 500, cur_nox);
     old_nox = disp_nox;
@@ -940,8 +1354,8 @@ void deseneazaDashboard() {
   // ---- TEMP ----
   float disp_temp = round(temp * 10.0) / 10.0;
   if (disp_temp != old_temp) {
-    String vStr = (disp_temp == 0) ? "Init" : String(disp_temp, 1);
-    drawUpdatingTextCentered(vStr, 203, 138, &FreeSansBold18pt7b, getTempColor(disp_temp),
+    String vStr = !validitateSenzor.temperatura ? "Init" : String(disp_temp, 1);
+    drawUpdatingTextCentered(vStr, 203, 138, &FreeSansBold18pt7b, !validitateSenzor.temperatura ? ST77XX_WHITE : getTempColor(disp_temp),
                              bx_temp, by_temp, bw_temp, bh_temp);
     updateCursor(171, 150, 65, disp_temp, 16, 30, cur_temp);
     old_temp = disp_temp;
@@ -950,8 +1364,8 @@ void deseneazaDashboard() {
   // ---- UMIDITATE ----
   float disp_umid = round(umiditate * 10.0) / 10.0;
   if (disp_umid != old_umid) {
-    String vStr = (disp_umid == 0) ? "Init" : String(disp_umid, 1);
-    drawUpdatingTextCentered(vStr, 275, 138, &FreeSansBold18pt7b, getHumidColor(disp_umid),
+    String vStr = !validitateSenzor.umiditate ? "Init" : String(disp_umid, 1);
+    drawUpdatingTextCentered(vStr, 275, 138, &FreeSansBold18pt7b, !validitateSenzor.umiditate ? ST77XX_WHITE : getHumidColor(disp_umid),
                              bx_umid, by_umid, bw_umid, bh_umid);
     updateCursor(243, 150, 65, disp_umid, 10, 90, cur_umid);
     old_umid = disp_umid;
@@ -1002,12 +1416,19 @@ void deseneazaDashboard() {
     old_ssid = ssidCurent;
   }
 
-  // Dot WiFi (se redesenează la fiecare cadru la coordonate fixe)
-  tft.fillCircle(146, 177, 3, wifiConn ? ST77XX_GREEN : ST77XX_RED);
+  // Verde = publicare confirmata; portocaliu = WiFi prezent, cloud neconfirmat.
+  // Impulsul albastru de 1s marcheaza confirmarea periodica, fara sa ascunda ceasul.
+  const uint64_t acumIndicator = esp_timer_get_time() / 1000ULL;
+  const bool cloudConfirmat = stareCloud.confirmatRecent(acumIndicator);
+  tft.fillCircle(146, 177, 3, !wifiConn ? ST77XX_RED : stareCloud.impulsConfirmare(acumIndicator)
+      ? ST77XX_BLUE : cloudConfirmat ? ST77XX_GREEN : ST77XX_ORANGE);
 
   // ---- ORA + DATA ----
   struct tm timeinfo;
-  if (getLocalTime(&timeinfo)) {
+  // getLocalTime(..., 0) poate rata bucla interna la schimbarea milisecundei.
+  // Ora validata prin SNTP se citeste direct, fara asteptare si fara falsul Sync.
+  const time_t oraAfisaj = time(nullptr);
+  if (ceasValid() && localtime_r(&oraAfisaj, &timeinfo) != nullptr) {
     char timeStringBuff[10];
     strftime(timeStringBuff, sizeof(timeStringBuff), "%H:%M", &timeinfo);
     String tStr = String(timeStringBuff);
@@ -1039,11 +1460,19 @@ void deseneazaDashboard() {
 // SETUP
 // =========================================================================
 void setup() {
+  char timerBootId[17];
+  snprintf(timerBootId, sizeof(timerBootId), "%08lx%08lx", (unsigned long)esp_random(), (unsigned long)esp_random());
+  stareTimer.incepeBoot(timerBootId);
   Serial.begin(115200);
+  setenv("TZ", TZ_INFO, 1);
+  tzset();
+  sntp_set_time_sync_notification_cb(confirmaNtp);
 
+  captureazaEtapaAnterioaraReset();
   if (esp_reset_reason() == ESP_RST_POWERON || esp_reset_reason() == ESP_RST_BROWNOUT) {
     strcpy(rtc_last_state, "Sistem_Pornit_Priza");
   }
+  rtc_last_state[sizeof(rtc_last_state) - 1] = '\0';
   motivRestart = getResetReasonString();
 
   // ---- Pasul 1: Rezervare memorie ----
@@ -1122,6 +1551,9 @@ void setup() {
   rgbLed.show();
   storace.begin("smart_air", false);
   offsetTemperatura = storace.getFloat("tempOffset", 0.0);
+  if (!isfinite(offsetTemperatura) || offsetTemperatura < -3.0f || offsetTemperatura > 3.0f)
+    offsetTemperatura = 0;
+  offsetSolicitatTemp = offsetTemperatura;
 
   // ---- Pasul 6: Senzor SEN66 ----
   bootMsg("[6/8] Senzor SEN66...", 6);
@@ -1145,17 +1577,19 @@ void setup() {
   sen66.startContinuousMeasurement();
   delay(50);
   tSenzorStart          = millis();
+  warmupSenzorTerminat = false;
   tUltimaCitireReusita  = millis();
 
-  sen66.setTemperatureOffsetParameters((int16_t)(offsetTemperatura * 200), 0, 0, 0);
-  delay(20);
+  aplicaOffsetTemp(offsetSolicitatTemp);
 
   // ---- Pasul 7: WiFi ----
   bootMsg("[7/8] Conectare WiFi...", 7);
   #ifdef DEBUG_SERIAL
   Serial.println("[7/8] Adaugare retele WiFi cunoscute si conectare...");
   #endif
+  WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
 
   // =============================================
   // LISTA RETELE WIFI CUNOSCUTE (din secrete.h)
@@ -1164,11 +1598,8 @@ void setup() {
   if (strlen(WIFI3_SSID) > 0) wifiMulti.addAP(WIFI3_SSID, WIFI3_PASS);
   // =============================================
 
-  int conectareTries = 0;
-  while (wifiMulti.run() != WL_CONNECTED && conectareTries < 20) {
-    delay(500);
-    conectareTries++;
-  }
+  // O singura incercare la boot; restul sunt programate in loop, fara asteptarea routerului.
+  wifiMulti.run(1500);
   #ifdef DEBUG_SERIAL
   if (WiFi.status() == WL_CONNECTED) {
     Serial.print(">> Conectat la: "); Serial.println(WiFi.SSID());
@@ -1197,6 +1628,7 @@ void setup() {
   ArduinoOTA.setHostname("SmartPurifier");
   ArduinoOTA.setPassword(OTA_PASSWORD);
   ArduinoOTA.onStart([]() { esp_task_wdt_delete(NULL); });
+  ArduinoOTA.onError([](ota_error_t) { esp_task_wdt_add(NULL); });
   ArduinoOTA.begin();
 
   pinMode(PIN_FAN_RPM, INPUT_PULLUP);
@@ -1215,6 +1647,25 @@ void setup() {
 // =========================================================================
 // LOOP
 // =========================================================================
+void intretineFirebase() {
+  const uint64_t acum = esp_timer_get_time() / 1000ULL;
+  if (!stareCloud.recuperareNecesara(firebaseGata, WiFi.status() == WL_CONNECTED, acum)) return;
+  updateState("Recuperare_Firebase");
+  // Recuperarea nu depinde de ready(): exact autentificarea poate ramane indisponibila.
+  // Inchidem numai socket-urile detinute de loop. Task-ul de stream isi pastreaza obiectul.
+  if (!firebaseAvertizat) {
+    firebaseAvertizat = true;
+    logSystem("Firebase fara confirmare 120s; refacere conexiune (HTTP " + String(fbdoScriere.httpCode()) + ")");
+  }
+  fbdoScriere.stopWiFiClient();
+  fbdoCitire.stopWiFiClient();
+  // Fluxul public ReAuthenticate reface si JWT-ul service account; refreshToken()
+  // ar cere un refresh_token OAuth care nu exista in configuratia cu cheie privata.
+  Firebase.reset(&config);
+  Firebase.begin(&config, &auth);
+  updateState("Running_Loop");
+}
+
 void loop() {
   ArduinoOTA.handle();
   esp_task_wdt_reset();
@@ -1223,12 +1674,14 @@ void loop() {
   time_t tNow; time(&tNow);
   struct tm timeinfo; localtime_r(&tNow, &timeinfo);
 
+  intretineCeas(t);
+
   // ---- Gestionare WiFi + reconectare multi-AP ----
   if (WiFi.status() != WL_CONNECTED) {
-    if (t - tAntWifi >= 30000) {
+    if (t - tAntWifi >= 10000) {
       tAntWifi = t;
       if (!wifiAvertizat) { wifiAvertizat = true; updateState("Pierdut_WiFi"); }
-      wifiMulti.run();
+      wifiMulti.run(1500);
     }
   } else {
     if (wifiAvertizat) {
@@ -1244,13 +1697,10 @@ void loop() {
     }
 
     static bool firebaseInitializat = false;
-    if (!firebaseInitializat) {
+    if (!firebaseInitializat && ceasValid()) {
       updateState("Init_Firebase");
-      configTzTime(TZ_INFO, ntpServer);
-      time_t testT; int retries = 0;
-      while (time(&testT) < 1000000000 && retries < 10) {
-        delay(500); retries++; esp_task_wdt_reset(); yield();
-      }
+      // Firebase porneste numai dupa confirmarea NTP, astfel biblioteca nu initiaza
+      // propriul configTime(UTC) si nu suprascrie fusul EET/EEST.
 
       config.api_key        = API_KEY;
       config.database_url   = DATABASE_URL;
@@ -1273,6 +1723,8 @@ void loop() {
       config.token_status_callback = tokenStatusCallback;
       fbdoScriere.setBSSLBufferSize(2048, 1024);
       fbdoCitire.setBSSLBufferSize(2048, 1024);
+      // O zi contine sase serii de cate 288 valori; limita implicita de 2 KB o trunchiaza.
+      fbdoCitire.setResponseSize(32768);
       fbdoStream.setBSSLBufferSize(2048, 1024);
       fbdoFcm.setBSSLBufferSize(4096, 1024);
 
@@ -1295,6 +1747,12 @@ void loop() {
       updateState("Running_Loop");
     }
   }
+
+  intretineFirebase();
+
+  // Operatiile de retea pot dura; renovarile folosesc timpul real de dupa ele.
+  t = millis();
+  time(&tNow); localtime_r(&tNow, &timeinfo);
 
   // ---- Tahometru (1 secunda) ----
   if (t - tAntRpm >= 1000) {
@@ -1327,6 +1785,7 @@ void loop() {
     uint16_t error = sen66.readMeasuredValues(t_pm1, t_pm25, t_pm4, t_pm10,
                                               t_umid, t_temp, t_voc, t_nox, t_co2);
     if (error) {
+      invalideazaMasurari();
       if (!senzorAvertizat) { logSystem("Eroare citire SEN66: Cod " + String(error)); senzorAvertizat = true; }
       if (senzorEroriConsecutive < 1000) senzorEroriConsecutive++;
       if (senzorEroriConsecutive >= 15) senzorEsuatComm = true;   // failure persistenta (~15s fara raspuns)
@@ -1335,30 +1794,28 @@ void loop() {
       senzorEroriConsecutive = 0;
       senzorEsuatComm = false;
       tUltimaCitireReusita = t;
+      diagnosticAreCitireSenzor = true;
+      diagnosticUltimaCitireMs = esp_timer_get_time() / 1000ULL;
 
-      if (t_co2 != 65535) {
-        unsigned long uptimeSenzor = t - tSenzorStart;
-        bool prafValid  = (uptimeSenzor >= 20000);
-        bool co2Valid   = (uptimeSenzor >= 20000);
-        bool climaValid = (uptimeSenzor >= 60000);
-        bool gazeValid  = (uptimeSenzor >= 60000);
-
-        if (prafValid)  { pm1=t_pm1; pm25=t_pm25; pm4=t_pm4; pm10=t_pm10; sumPM1+=pm1; sumPM25+=pm25; sumPM4+=pm4; sumPM10+=pm10; countPM++; }
-        if (co2Valid)   { co2=t_co2; sumCO2+=co2; countCO2++; }
-        if (climaValid) { temp=t_temp; umiditate=t_umid; sumTemp+=temp; sumUmid+=umiditate; countClima++; }
-        if (gazeValid)  {
-          // Indicii SEN66 sunt valizi in intervalul 1..500; valoarea 0 inseamna "indisponibil",
-          // deci o excludem ca sa nu murdareasca media (punctul ramane gol -999, mai corect).
-          if (t_voc >= 1 && t_voc <= 500) { voc=t_voc; sumVOC+=voc; countVOC++; }
-          if (t_nox >= 1 && t_nox <= 500) { nox=t_nox; sumNOx+=nox; countNOx++; }
-        }
-        areDate = (prafValid || co2Valid || climaValid || gazeValid);
-
-        // Alerte push trimise direct de placa (doar dupa warmup si cu cooldown)
-        verificaAlertePoluare(t);
-      } else {
-        areDate = false;
-      }
+      validitateSenzor = valideazaCitire(t_pm1, t_pm25, t_pm4, t_pm10,
+          t_umid, t_temp, t_voc, t_nox, t_co2, varstaSenzor(t));
+      // Fiecare canal are validitate proprie; un CO2 indisponibil nu ascunde praful.
+      if (validitateSenzor.pm) {
+        pm1=t_pm1; pm25=t_pm25; pm4=t_pm4; pm10=t_pm10;
+        sumPM1+=pm1; sumPM25+=pm25; sumPM4+=pm4; sumPM10+=pm10; countPM++;
+      } else { pm1=pm25=pm4=pm10=-1; }
+      co2 = validitateSenzor.co2 ? t_co2 : 65535;
+      if (validitateSenzor.co2) { sumCO2+=co2; countCO2++; }
+      temp = validitateSenzor.temperatura ? t_temp : -999;
+      umiditate = validitateSenzor.umiditate ? t_umid : -999;
+      if (validitateSenzor.temperatura) { sumTemp+=temp; countTemp++; }
+      if (validitateSenzor.umiditate) { sumUmid+=umiditate; countUmid++; }
+      voc = validitateSenzor.voc ? t_voc : 65535;
+      nox = validitateSenzor.nox ? t_nox : 65535;
+      if (validitateSenzor.voc) { sumVOC+=voc; countVOC++; }
+      if (validitateSenzor.nox) { sumNOx+=nox; countNOx++; }
+      areDate = validitateSenzor.existaDate();
+      verificaAlertePoluare(t);
     }
     updateState("Running_Loop");
   }
@@ -1366,7 +1823,7 @@ void loop() {
   // ---- Watchdog Senzor: reinitializare dupa 15s fara citire ----
   if (t - tUltimaCitireReusita > 15000) {
     tUltimaCitireReusita = t;
-    areDate = false;
+    invalideazaMasurari();
     logSystem("WDT: Senzorul SEN66 a blocat citirile de 15s. Reinitializare...");
     updateState("Reset_Senzor_Hardware");
 
@@ -1394,12 +1851,20 @@ void loop() {
     sen66.startContinuousMeasurement();
     tReset = millis(); while (millis() - tReset < 50) { yield(); }
     tSenzorStart = millis();
+    warmupSenzorTerminat = false;
 
-    sen66.setTemperatureOffsetParameters((int16_t)(offsetTemperatura * 200), 0, 0, 0);
-    tReset = millis(); while (millis() - tReset < 20) { yield(); }
+    offsetFortatLaBoot = false;
+    offsetIncercat = false;
+    aplicaOffsetTemp(offsetSolicitatTemp);
 
     updateState("Running_Loop");
   }
+
+  // Reinitializarea senzorului poate dura; nu scadem un t vechi din noul tSenzorStart.
+  t = millis(); time(&tNow); localtime_r(&tNow, &timeinfo);
+
+  // Reincercarea este limitata in aplicaOffsetTemp la cel mult o comanda la 10 secunde.
+  aplicaOffsetTemp(offsetSolicitatTemp);
 
   // ---- Salvare calibrare VOC la fiecare 6 ore ----
   if (areDate && (t - tAntVocSave >= 21600000)) {
@@ -1415,13 +1880,14 @@ void loop() {
     updateState("Running_Loop");
   }
 
+  intretineTimer();
   // ---- Logica Auto / Manual ventilator ----
   bool comandaEsteAuto = (vitezaDinAplicatie == 0);
   if (WiFi.status() != WL_CONNECTED && !comandaEsteAuto && vitezaDinAplicatie > 5) comandaEsteAuto = true;
   isAutoMode = comandaEsteAuto;
 
   if (isAutoMode) {
-    if (areDate) {
+    if (validitateSenzor.pm) {
       int vitezaDorita = 100;
       if      (pm25 <= 0.5)  vitezaDorita = 25;
       else if (pm25 <= 2.0)  vitezaDorita = 35;
@@ -1448,20 +1914,29 @@ void loop() {
   }
 
   // ---- Night Mode programat (fereastra orara aplicata cu ceasul propriu NTP) ----
-  // Inlocuieste scheduler-ul din serviciul de fundal al telefonului: placa e mereu
-  // pornita si are ora exacta, deci fereastra se respecta si cu telefonul inchis.
-  if (nmAuto && timeinfo.tm_year > 120 && t - tAntNmCheck >= 30000) {
-    tAntNmCheck = t;
-    int minutZi = timeinfo.tm_hour * 60 + timeinfo.tm_min;
-    bool inFereastra = (nmStartMin <= nmEndMin)
-                         ? (minutZi >= nmStartMin && minutZi < nmEndMin)
-                         : (minutZi >= nmStartMin || minutZi < nmEndMin);
-    if (inFereastra != nightModeApp) {
-      nightModeApp = inFereastra;
-      if (WiFi.status() == WL_CONNECTED && Firebase.ready() && firebaseGata)
-        Firebase.RTDB.setBoolAsync(&fbdoScriere, "/SenzoriAer/setari/night_mode", inFereastra);
-      logSystem(inFereastra ? "Night Mode pornit (programat)" : "Night Mode oprit (programat)");
-    }
+  // Un snapshot vechi nu trebuie sa anuleze programul local la fiecare reconciliere.
+  // Fara ora valida pastram starea efectiva; in manual respectam valoarea primita.
+  const bool programNmValid = nmAuto && ceasValid() && timeinfo.tm_year > 120;
+  bool nightModeDorit = nmAuto ? nightModeApp : nightModePrimit;
+  if (programNmValid) {
+    const int minutZi = timeinfo.tm_hour * 60 + timeinfo.tm_min;
+    nightModeDorit = (nmStartMin <= nmEndMin)
+                      ? (minutZi >= nmStartMin && minutZi < nmEndMin)
+                      : (minutZi >= nmStartMin || minutZi < nmEndMin);
+  }
+  if (nightModeDorit != nightModeApp) {
+    nightModeApp = nightModeDorit;
+    if (programNmValid)
+      logSystem(nightModeApp ? "Night Mode pornit (programat)" : "Night Mode oprit (programat)");
+  }
+  // Confirmam numai frunza night_mode. Esecul pastreaza diferenta pentru retry,
+  // fara alte tranzitii/loguri; polling-ul nu reseteaza limita de 30 secunde.
+  if (programNmValid && nightModePrimit != nightModeApp &&
+      uint32_t(t - tAntNmPublicare) >= 30000 && firebaseGata &&
+      WiFi.status() == WL_CONNECTED && Firebase.ready()) {
+    tAntNmPublicare = t;
+    if (Firebase.RTDB.setBool(&fbdoScriere, "/SenzoriAer/setari/night_mode", nightModeApp))
+      nightModePrimit = nightModeApp;
   }
 
   // ---- Bucla UI (500ms) ----
@@ -1482,7 +1957,7 @@ void loop() {
       ledcWrite(PIN_TFT_BL, map(luminozitateEcran, 0, 100, 0, 255));
 
       // Prioritate stari LED/ecran: (1) eroare comunicare senzor  (2) warmup  (3) calitate aer
-      bool inWarmup = (t - tSenzorStart < 60000UL);
+      bool inWarmup = (varstaSenzor(t) < 60000UL);
 
       if (senzorEsuatComm) {
         // (1) Senzorul SEN66 nu raspunde -> LED MOV + ecran dedicat de eroare
@@ -1499,11 +1974,13 @@ void loop() {
           rgbLed.setPixelColor(0, rgbLed.Color(0, 80, 255));
         }
         // (3) Calitate aer normala
-        else if (pm25 >= 35 || co2 >= 1600 || (voc >= 400 && voc <= 500) || (nox >= 300 && nox <= 500))
+        else if (!areDate)
+          rgbLed.setPixelColor(0, rgbLed.Color(160, 0, 240));
+        else if (pm25 >= 35 || (validitateSenzor.co2 && co2 >= 1600) || (voc >= 400 && voc <= 500) || (nox >= 300 && nox <= 500))
           rgbLed.setPixelColor(0, rgbLed.Color(255, 0, 0));
-        else if (pm25 >= 12 || co2 >= 1200 || (voc >= 250 && voc <= 500) || (nox >= 150 && nox <= 500))
+        else if (pm25 >= 12 || (validitateSenzor.co2 && co2 >= 1200) || (voc >= 250 && voc <= 500) || (nox >= 150 && nox <= 500))
           rgbLed.setPixelColor(0, rgbLed.Color(255, 144, 0));
-        else if (pm25 >= 5  || (co2 >= 800 && co2 != 0) || (voc >= 150 && voc <= 500) || (nox >= 20 && nox <= 500))
+        else if (pm25 >= 5  || (validitateSenzor.co2 && co2 >= 800) || (voc >= 150 && voc <= 500) || (nox >= 20 && nox <= 500))
           rgbLed.setPixelColor(0, rgbLed.Color(255, 255, 0));
         else
           rgbLed.setPixelColor(0, rgbLed.Color(0, 255, 0));
@@ -1515,6 +1992,117 @@ void loop() {
     }
     updateState("Running_Loop");
   }
+
+  // NB: NU repornim stream-ul manual din loop (beginStream pe fbdoStream ar rula concurent cu
+  // task-ul intern al setStreamCallback pe acelasi obiect -> Panic). Task-ul bibliotecii se
+  // reconecteaza singur; daca totusi ramane cazut, plasa de reconciliere la 60s (mai jos, pe
+  // fbdoCitire) aplica oricum setarile — deci niciun blocaj de durata pentru utilizator.
+
+  // ---- Setari: procesarea evenimentelor primite pe stream ----
+  // Serverul trimite la (re)conectare un snapshot complet (path "/"), apoi cate un
+  // eveniment per camp schimbat. Procesam aici, pe task-ul principal, ca atunci cand
+  // o comanda blocheaza (ex. curatarea ~11s) sa nu omoram task-ul de stream.
+  if (coadaSetari != NULL) {
+    EvenimentSetari ev;
+    for (int procesate=0; procesate<4 && xQueueReceive(coadaSetari, &ev, 0) == pdTRUE; ++procesate) {
+      updateState("Aplicare_Setari_FB");
+      String cale(ev.path);
+      if (cale == "/" || cale.length() == 0) {
+        FirebaseJson json;
+        json.setJsonData(ev.data);
+        aplicaSetariJson(json, false);
+      } else {
+        aplicaSetareSingura(cale, String(ev.data));
+      }
+      updateState("Running_Loop");
+    }
+  }
+
+  // ---- Setari: reconciliere periodica (PLASA DE SIGURANTA) ----
+  // Stream-ul de mai sus poate muri silentios dupa multe ore (refresh token OAuth2 la 1h,
+  // sesiune SSL picata) FARA sa declanseze callback-ul de timeout -> placa n-ar mai
+  // reactiona la nicio setare desi trimite date normal. Recitim tot nodul la 60s, ca
+  // setarile (si comenzile) sa fie aplicate oricum in cel mult un minut. In functionare
+  // normala stream-ul livreaza instant, deci asta intervine doar cand stream-ul a cazut.
+  if (firebaseGata && WiFi.status() == WL_CONNECTED && Firebase.ready() &&
+      (necesitaSetariVentilator || (t - tAntPollSetari >= 60000) ||
+       (__atomic_load_n(&necesitaReconciliere, __ATOMIC_RELAXED) && t - tAntPollSetari >= 10000))) {
+    tAntPollSetari = t;
+    necesitaSetariVentilator = false;
+    __atomic_store_n(&necesitaReconciliere, false, __ATOMIC_RELAXED);
+    updateState("Reconciliere_Setari_FB");
+    if (Firebase.RTDB.getJSON(&fbdoCitire, "/SenzoriAer/setari"))
+      aplicaSetariJson(fbdoCitire.jsonObject(), true);
+    else __atomic_store_n(&necesitaReconciliere, true, __ATOMIC_RELAXED);
+    updateState("Running_Loop");
+  }
+
+  // ---- Trimitere date live catre Firebase ----
+  unsigned long intervalTrimitere = 10000;
+  if (currentFanSpeed != targetFanSpeed || modLiveRapid) intervalTrimitere = 1000;
+
+  if (firebaseGata && WiFi.status() == WL_CONNECTED && Firebase.ready() && (t - tAntLive >= intervalTrimitere)) {
+    tAntLive = t;
+    updateState("Trimitere_Live_FB");
+
+    const bool cereConfirmare = stareCloud.necesitaConfirmare(esp_timer_get_time() / 1000ULL);
+    FirebaseJson jsonLive;
+    intretineTimer();
+    adaugaStareTimer(jsonLive, "Timer", true);
+    // Metadate coerente intr-un singur nod, numai la publicarea confirmata (~60 s).
+    // Timestamp propriu: un firmware vechi reinstalat nu improspateaza acest raport.
+    if (cereConfirmare) {
+      jsonLive.set("Firmware/versiune", VERSIUNE_FIRMWARE);
+      jsonLive.set("Firmware/build", BUILD_FIRMWARE);
+      jsonLive.set("Firmware/raportat_la/.sv", "timestamp");
+      adaugaDiagnostic(jsonLive);
+    }
+    jsonLive.set("last_update/.sv",      "timestamp");
+    jsonLive.set("RPM",                  rpmReal);
+    jsonLive.set("ProcentVentilator",    targetFanSpeed);
+    jsonLive.set("Telemetrie_RAM_Liber", ESP.getFreeHeap());
+    jsonLive.set("Telemetrie_WiFi_RSSI", WiFi.RSSI());
+    // esp_timer_get_time() e pe 64 biti (microsecunde) si NU se reseteaza la ~49.7 zile
+    // asa cum face millis() (care e pe 32 biti). Astfel uptime-ul ramane corect mereu.
+    jsonLive.set("Telemetrie_Uptime_Sec",(int)(esp_timer_get_time() / 1000000LL));
+    jsonLive.set("Telemetrie_Temp_Core", temperatureRead());
+    if (offsetFortatLaBoot) jsonLive.set("Setari_Offset_Temp", offsetTemperatura);
+    else jsonLive.set("Setari_Offset_Temp");
+
+    // Un camp invalid devine null in RTDB; heartbeat-ul nu transforma o valoare veche in una noua.
+    if (validitateSenzor.co2) jsonLive.set("CO2", co2); else jsonLive.set("CO2");
+    if (validitateSenzor.pm) {
+      jsonLive.set("PM1", pm1); jsonLive.set("PM25", pm25); jsonLive.set("PM4", pm4); jsonLive.set("PM10", pm10);
+    } else { jsonLive.set("PM1"); jsonLive.set("PM25"); jsonLive.set("PM4"); jsonLive.set("PM10"); }
+    if (validitateSenzor.voc) jsonLive.set("VOC", (int)voc); else jsonLive.set("VOC");
+    if (validitateSenzor.nox) jsonLive.set("NOx", (int)nox); else jsonLive.set("NOx");
+    if (validitateSenzor.temperatura) jsonLive.set("Temperatura", temp); else jsonLive.set("Temperatura");
+    if (validitateSenzor.umiditate) jsonLive.set("Umiditate", umiditate); else jsonLive.set("Umiditate");
+
+    // O data pe minut asteptam confirmarea HTTP. Restul actualizarilor pastreaza
+    // ritmul async; succesul lor inseamna doar expediere, nu acceptare de server.
+    const bool trimis = cereConfirmare
+        ? Firebase.RTDB.updateNodeSilent(&fbdoScriere, "/SenzoriAer", &jsonLive)
+        : Firebase.RTDB.updateNodeAsync(&fbdoScriere, "/SenzoriAer", &jsonLive);
+    if (cereConfirmare && trimis) {
+      stareCloud.confirma(esp_timer_get_time() / 1000ULL);
+      if (firebaseAvertizat) {
+        firebaseAvertizat = false;
+        logSystem("Firebase restabilit: publicare confirmata");
+      }
+    }
+    if (!trimis) {
+      String motivEroare = fbdoScriere.errorReason();
+      #ifdef DEBUG_SERIAL
+      Serial.println("⚠️ Pachet Live pierdut! Motiv: " + motivEroare);
+      #endif
+      if (motivEroare.indexOf("buffer") != -1 || motivEroare.indexOf("memory") != -1) {
+        logSystem("Eroare buffer Live FB: " + motivEroare);
+      }
+    }
+    updateState("Running_Loop");
+  }
+
 
   // ---- Istoric local cand (inca) nu exista conexiune cu Firebase ----
   // La boot fara WiFi nu avem nici ora exacta (NTP vine dupa WiFi), asa ca salvam
@@ -1531,157 +2119,77 @@ void loop() {
     updateState("Running_Loop");
   }
 
-  // ---- Sincronizare initiala istoric din Firebase ----
+  trimiteJurnalDacaNecesar();
+
+  // ---- Sincronizare initiala: o citire pe iteratie, cu reluare dupa esec ----
   if (!istoricRecuperat) {
-    if (WiFi.status() == WL_CONNECTED && Firebase.ready() && firebaseGata) {
-      // Nu desenam overlay-ul de sync peste ecranul de eroare senzor sau peste ecranul stins (night mode)
-      if (!senzorEsuatComm && !isNightMode) {
-        tft.fillRect(4, 168, 153, 68, C_PANEL);
-        tft.setFont(&FreeSans9pt7b); tft.setTextColor(ST77XX_ORANGE);
-        tft.setCursor(12, 195); tft.print("Sync DB...");
+    static String cloud[9];
+    static long timpCloud = 0;
+    static String dataCloud;
+    static uint8_t etapa = 0;
+    static uint32_t ultimaIncercare = 0;
+    static bool asteapta = false;
+    const char* chei[] = {"Istoric_PM25", "Istoric_CO2", "Istoric_VOC", "Istoric_NOx", "Istoric_Temp", "Istoric_Umid", "Istoric_PM1", "Istoric_PM4", "Istoric_PM10"};
+    if (ceasValid() && firebaseGata && WiFi.status() == WL_CONNECTED && Firebase.ready() &&
+        (!asteapta || uint32_t(millis() - ultimaIncercare) >= 10000)) {
+      updateState("Recuperare_Istoric_FB");
+      asteapta = false;
+      if (etapa == 0 && jurnalRecuperat) etapa = 1;
+      String cheie = etapa == 0 ? "ErrorLog" : etapa == 1 ? "last_history_time" : etapa == 2 ? "last_archived_date" : chei[etapa-3];
+      bool ok = Firebase.RTDB.get(&fbdoCitire, "/SenzoriAer/" + cheie);
+      const bool caleLipsa = fbdoCitire.httpCode() == FIREBASE_ERROR_PATH_NOT_EXIST;
+      ok = ok || caleLipsa;
+      if (ok) {
+        const String tip = fbdoCitire.dataType();
+        const bool lipsa = caleLipsa || tip == "null";
+        if (etapa == 1) {
+          ok = lipsa || tip == "int";
+          if (ok) timpCloud = lipsa ? 0 : fbdoCitire.intData();
+        } else {
+          ok = lipsa || tip == "string";
+          if (ok) {
+            const String valoare = lipsa ? "" : fbdoCitire.stringData();
+            if (etapa == 0) recupereazaJurnal(valoare);
+            else if (etapa == 2) dataCloud = valoare;
+            else cloud[etapa-3] = valoare;
+          }
+        }
       }
-
-      updateState("Sync_Jurnal");
-      if (Firebase.RTDB.getString(&fbdoCitire, "/SenzoriAer/ErrorLog"))       jurnalErori = fbdoCitire.stringData(); esp_task_wdt_reset(); yield();
-      if (!bootLogSent) { logSystem("Sistem Repornit: " + motivRestart); bootLogSent = true; esp_task_wdt_reset(); yield(); }
-      updateState("Sync_Time");
-      if (Firebase.RTDB.getInt(&fbdoCitire, "/SenzoriAer/last_history_time")) lastIstoricSaveTime = fbdoCitire.intData(); esp_task_wdt_reset(); yield();
-      updateState("Sync_Date");
-      if (Firebase.RTDB.getString(&fbdoCitire, "/SenzoriAer/last_archived_date")) lastArchivedDateStr = fbdoCitire.stringData(); esp_task_wdt_reset(); yield();
-
-      // Daca am acumulat puncte offline, calculam cate sloturi goale (-999) trebuie
-      // puse intre ULTIMUL punct din cloud si PRIMUL punct local. Timpul (de perete al)
-      // primului punct local = acum - cat a trecut de la salvarea lui, pe ceasul intern.
-      int gapSlots = 0;
-      if (puncteLocale > 0 && lastIstoricSaveTime > 0) {
-        time_t primaLocala = tNow - (time_t)((t - millisPrimaSalvareLocala) / 1000UL);
-        gapSlots = (int)((primaLocala - (time_t)lastIstoricSaveTime) / 300) - 1;
-        if (gapSlots < 0)   gapSlots = 0;
-        if (gapSlots > 288) gapSlots = 288;
-      }
-
-      updateState("Sync_IstoricPM25");
-      if (Firebase.RTDB.getString(&fbdoCitire, "/SenzoriAer/Istoric_PM25"))    istPM25 = mergeIstoricCloudLocal(fbdoCitire.stringData(), istPM25, gapSlots); esp_task_wdt_reset(); yield();
-      updateState("Sync_IstoricCO2");
-      if (Firebase.RTDB.getString(&fbdoCitire, "/SenzoriAer/Istoric_CO2"))     istCO2  = mergeIstoricCloudLocal(fbdoCitire.stringData(), istCO2,  gapSlots); esp_task_wdt_reset(); yield();
-      updateState("Sync_IstoricVOC");
-      if (Firebase.RTDB.getString(&fbdoCitire, "/SenzoriAer/Istoric_VOC"))     istVOC  = mergeIstoricCloudLocal(fbdoCitire.stringData(), istVOC,  gapSlots); esp_task_wdt_reset(); yield();
-      updateState("Sync_IstoricNOx");
-      if (Firebase.RTDB.getString(&fbdoCitire, "/SenzoriAer/Istoric_NOx"))     istNOx  = mergeIstoricCloudLocal(fbdoCitire.stringData(), istNOx,  gapSlots); esp_task_wdt_reset(); yield();
-      updateState("Sync_IstoricTemp");
-      if (Firebase.RTDB.getString(&fbdoCitire, "/SenzoriAer/Istoric_Temp"))    istTemp = mergeIstoricCloudLocal(fbdoCitire.stringData(), istTemp, gapSlots); esp_task_wdt_reset(); yield();
-      updateState("Sync_IstoricUmid");
-      if (Firebase.RTDB.getString(&fbdoCitire, "/SenzoriAer/Istoric_Umid"))    istUmid = mergeIstoricCloudLocal(fbdoCitire.stringData(), istUmid, gapSlots); esp_task_wdt_reset(); yield();
-      updateState("Sync_IstoricPM1");
-      if (Firebase.RTDB.getString(&fbdoCitire, "/SenzoriAer/Istoric_PM1"))     istPM1  = mergeIstoricCloudLocal(fbdoCitire.stringData(), istPM1,  gapSlots); esp_task_wdt_reset(); yield();
-      updateState("Sync_IstoricPM4");
-      if (Firebase.RTDB.getString(&fbdoCitire, "/SenzoriAer/Istoric_PM4"))     istPM4  = mergeIstoricCloudLocal(fbdoCitire.stringData(), istPM4,  gapSlots); esp_task_wdt_reset(); yield();
-      updateState("Sync_IstoricPM10");
-      if (Firebase.RTDB.getString(&fbdoCitire, "/SenzoriAer/Istoric_PM10"))    istPM10 = mergeIstoricCloudLocal(fbdoCitire.stringData(), istPM10, gapSlots); esp_task_wdt_reset(); yield();
-
-      if (puncteLocale > 0) {
-        // sfarsitul real al stringului e acum ultimul punct local (pe timp de perete)
-        lastIstoricSaveTime = (long)(tNow - (time_t)((t - millisUltimaSalvareLocala) / 1000UL));
-        logSystem("Istoric local recuperat: " + String(puncteLocale) + " puncte salvate offline.");
+      if (!ok) {
+        // Nicio serie locala nu a fost inlocuita; reluam un set complet dupa backoff.
+        etapa = 0; ultimaIncercare = millis(); asteapta = true;
+      } else if (++etapa == 12) {
+        time(&tNow); t = millis(); localtime_r(&tNow, &timeinfo);
+        int goluri = 0;
+        if (puncteLocale > 0 && timpCloud > 0) {
+          // Folosim ultima proba si numarul RETINUT, inclusiv dupa >24h offline.
+          const time_t ultimaLocala = tNow - uint32_t(t - millisUltimaSalvareLocala) / 1000;
+          const time_t primaLocala = ultimaLocala - (puncteLocale - 1) * 300;
+          goluri = constrain((int)(primaLocala / 300 - timpCloud / 300) - 1, 0, 288);
+        }
+        String* serii[] = {&istPM25, &istCO2, &istVOC, &istNOx, &istTemp, &istUmid, &istPM1, &istPM4, &istPM10};
+        for (int i=0; i<9; ++i) {
+          *serii[i] = mergeIstoricCloudLocal(cloud[i], *serii[i], goluri);
+          cloud[i] = "";
+        }
+        lastIstoricSaveTime = puncteLocale > 0 ? tNow - uint32_t(t - millisUltimaSalvareLocala) / 1000 : timpCloud;
+        lastArchivedDateStr = dataCloud;
         puncteLocale = 0;
+        istoricRecuperat = true; forceFullRedraw = true;
       }
-
-      istoricRecuperat = true; forceFullRedraw = true;
       updateState("Running_Loop");
     }
     return;
   }
 
-  // NB: NU repornim stream-ul manual din loop (beginStream pe fbdoStream ar rula concurent cu
-  // task-ul intern al setStreamCallback pe acelasi obiect -> Panic). Task-ul bibliotecii se
-  // reconecteaza singur; daca totusi ramane cazut, plasa de reconciliere la 60s (mai jos, pe
-  // fbdoCitire) aplica oricum setarile — deci niciun blocaj de durata pentru utilizator.
-
-  // ---- Setari: procesarea evenimentelor primite pe stream ----
-  // Serverul trimite la (re)conectare un snapshot complet (path "/"), apoi cate un
-  // eveniment per camp schimbat. Procesam aici, pe task-ul principal, ca atunci cand
-  // o comanda blocheaza (ex. curatarea ~11s) sa nu omoram task-ul de stream.
-  if (coadaSetari != NULL) {
-    EvenimentSetari ev;
-    while (xQueueReceive(coadaSetari, &ev, 0) == pdTRUE) {
-      updateState("Aplicare_Setari_FB");
-      String cale(ev.path);
-      if (cale == "/" || cale.length() == 0) {
-        FirebaseJson json;
-        json.setJsonData(ev.data);
-        aplicaSetariJson(json);
-      } else {
-        aplicaSetareSingura(cale, String(ev.data));
-      }
-      updateState("Running_Loop");
-    }
-  }
-
-  // ---- Setari: reconciliere periodica (PLASA DE SIGURANTA) ----
-  // Stream-ul de mai sus poate muri silentios dupa multe ore (refresh token OAuth2 la 1h,
-  // sesiune SSL picata) FARA sa declanseze callback-ul de timeout -> placa n-ar mai
-  // reactiona la nicio setare desi trimite date normal. Recitim tot nodul la 60s, ca
-  // setarile (si comenzile) sa fie aplicate oricum in cel mult un minut. In functionare
-  // normala stream-ul livreaza instant, deci asta intervine doar cand stream-ul a cazut.
-  if (WiFi.status() == WL_CONNECTED && Firebase.ready() && firebaseGata && (t - tAntPollSetari >= 60000)) {
-    tAntPollSetari = t;
-    updateState("Reconciliere_Setari_FB");
-    if (Firebase.RTDB.getJSON(&fbdoCitire, "/SenzoriAer/setari"))
-      aplicaSetariJson(fbdoCitire.jsonObject());
-    updateState("Running_Loop");
-  }
-
-  // ---- Trimitere date live catre Firebase ----
-  unsigned long intervalTrimitere = 10000;
-  if (currentFanSpeed != targetFanSpeed || modLiveRapid) intervalTrimitere = 1000;
-
-  if (WiFi.status() == WL_CONNECTED && Firebase.ready() && firebaseGata && (t - tAntLive >= intervalTrimitere)) {
-    tAntLive = t;
-    updateState("Trimitere_Live_FB");
-
-    FirebaseJson jsonLive;
-    jsonLive.set("last_update/.sv",      "timestamp");
-    jsonLive.set("RPM",                  rpmReal);
-    jsonLive.set("ProcentVentilator",    targetFanSpeed);
-    jsonLive.set("Telemetrie_RAM_Liber", ESP.getFreeHeap());
-    jsonLive.set("Telemetrie_WiFi_RSSI", WiFi.RSSI());
-    // esp_timer_get_time() e pe 64 biti (microsecunde) si NU se reseteaza la ~49.7 zile
-    // asa cum face millis() (care e pe 32 biti). Astfel uptime-ul ramane corect mereu.
-    jsonLive.set("Telemetrie_Uptime_Sec",(int)(esp_timer_get_time() / 1000000LL));
-    jsonLive.set("Telemetrie_Temp_Core", temperatureRead());
-    jsonLive.set("Setari_Offset_Temp",   offsetTemperatura);
-
-    if (areDate) {
-      jsonLive.set("CO2", co2);
-      jsonLive.set("PM1", pm1); jsonLive.set("PM25", pm25); jsonLive.set("PM4", pm4); jsonLive.set("PM10", pm10);
-      // Gazele si clima au warmup mai lung (60s) decat praful/CO2 (20s): in fereastra
-      // dintre ele voc/nox/temp/umid contin inca valorile de initializare (65535 / 0.0).
-      // Nu le trimitem, altfel aplicatia ar afisa "0.00 C" / "0.00 %" ca date reale
-      // timp de ~40s dupa fiecare restart al placutei.
-      if (voc >= 1 && voc <= 500) jsonLive.set("VOC", (int)voc);
-      if (nox >= 1 && nox <= 500) jsonLive.set("NOx", (int)nox);
-      if (t - tSenzorStart >= 60000UL) { jsonLive.set("Temperatura", temp); jsonLive.set("Umiditate", umiditate); }
-    }
-
-    if (!Firebase.RTDB.updateNodeAsync(&fbdoScriere, "/SenzoriAer", &jsonLive)) {
-      String motivEroare = fbdoScriere.errorReason();
-      #ifdef DEBUG_SERIAL
-      Serial.println("⚠️ Pachet Live pierdut! Motiv: " + motivEroare);
-      #endif
-      if (motivEroare.indexOf("buffer") != -1 || motivEroare.indexOf("memory") != -1) {
-        logSystem("Eroare buffer Live FB: " + motivEroare);
-      }
-    }
-    updateState("Running_Loop");
-  }
-
+  t = millis(); time(&tNow); localtime_r(&tNow, &timeinfo);
   // ---- Logica istorice + arhiva zilnica ----
-  if (timeinfo.tm_year > 120 && istoricRecuperat) {
+  if (ceasValid() && timeinfo.tm_year > 120 && istoricRecuperat) {
     int curentMin  = timeinfo.tm_min;
     int curentHour = timeinfo.tm_hour;
 
     // Curatare jurnal erori din 6 in 6 ore
-    if (curentHour % 6 == 0 && curentMin == 0 && WiFi.status() == WL_CONNECTED && Firebase.ready() && firebaseGata) {
+    if (curentHour % 6 == 0 && curentMin == 0 && firebaseGata && WiFi.status() == WL_CONNECTED && Firebase.ready()) {
       if (!eroriCuratateLaOra) {
         eroriCuratateLaOra = true;
         String jurnalCurat = ""; int startIdx = 0;
@@ -1693,7 +2201,7 @@ void loop() {
           if (hashIdx != -1) { long tsEroare = eroareTemp.substring(0, hashIdx).toInt(); if (tNow - tsEroare <= 86400) { if (jurnalCurat != "") jurnalCurat += "|"; jurnalCurat += eroareTemp; } }
           startIdx = endIdx + 1;
         }
-        if (jurnalCurat != jurnalErori) { jurnalErori = jurnalCurat; Firebase.RTDB.setStringAsync(&fbdoScriere, "/SenzoriAer/ErrorLog", jurnalErori); }
+        if (jurnalCurat != jurnalErori) { jurnalErori = jurnalCurat; jurnalModificat = true; }
         updateState("Running_Loop");
       }
     } else { eroriCuratateLaOra = false; }
@@ -1702,65 +2210,96 @@ void loop() {
     strftime(timeBuffToday, sizeof(timeBuffToday), "%Y_%m_%d", &timeinfo);
     String todayStr = String(timeBuffToday);
 
-    // Arhivare zilnica la schimbarea datei
-    if (lastArchivedDateStr != "" && todayStr != lastArchivedDateStr &&
-        WiFi.status() == WL_CONNECTED && Firebase.ready() && firebaseGata) {
-      updateState("Arhivare_Zilnica_FB");
-      String nodBaza = "/SenzoriAer/Arhiva_Zilnica/" + lastArchivedDateStr;
-
-      // Cate puncte din ziua NOUA exista deja in stringul de istoric (dupa padding)?
-      // Nu putem folosi ora curenta direct: la arhivarea exact la miezul noptii salvarea
-      // de la 00:00 inca nu a rulat (deci 0 puncte de azi), dar la o arhivare intarziata
-      // (net picat peste noapte) salvarile au continuat local intre timp. Calculam deci
-      // sfarsitul REAL al stringului: ultimul slot salvat + sloturile de padding pe care
-      // getPaddedHistory le va adauga (aceeasi formula "(gap/300)-1" ca la salvare).
+    // Pregatim ziua la schimbarea datei, chiar offline. O pastram pana la confirmarea serverului.
+    static String dataInAsteptare, ziDupaArhiva;
+    static String seriiInAsteptare[6];
+    static uint32_t ultimaIncercareArhiva = 0;
+    static bool arhivaAIncercat = false;
+    const char* numeArhiva[] = {"PM25", "CO2", "VOC", "NOx", "Temp", "Umid"};
+    // O corectie a ceasului inapoi nu trebuie sa eticheteze probe viitoare ca trecut.
+    if (dataInAsteptare == "" && lastArchivedDateStr != "" && todayStr > lastArchivedDateStr &&
+        lastIstoricSaveTime <= tNow) {
+      struct tm ieri = timeinfo;
+      ieri.tm_mday--; ieri.tm_hour=12; ieri.tm_min=0; ieri.tm_sec=0; ieri.tm_isdst=-1;
+      mktime(&ieri);
+      char dataIeri[12]; strftime(dataIeri, sizeof(dataIeri), "%Y_%m_%d", &ieri);
+      // Fereastra RAM nu poate reconstrui zile deja iesite din cele 24h retinute.
+      // Nu etichetam datele de ieri cu o data veche de saptamani.
+      dataInAsteptare = String(dataIeri);
+      arhivaDiagnosticInAsteptare = dataInAsteptare;
+      ziDupaArhiva = todayStr;
       int puncteAzi = 0;
       if (lastIstoricSaveTime > 0) {
-        long sloturiPad = ((tNow - lastIstoricSaveTime) / 300) - 1;
-        if (sloturiPad < 0) sloturiPad = 0;
-        time_t slotFinal = (time_t)lastIstoricSaveTime + (time_t)sloturiPad * 300;
+        long goluri = constrain((long)(tNow/300-lastIstoricSaveTime/300)-1, 0L, 288L);
+        time_t slotFinal = lastIstoricSaveTime + goluri*300;
         struct tm slotTm; localtime_r(&slotFinal, &slotTm);
-        char slotBuff[12];
-        strftime(slotBuff, sizeof(slotBuff), "%Y_%m_%d", &slotTm);
-        if (todayStr == String(slotBuff)) puncteAzi = (slotTm.tm_hour * 60 + slotTm.tm_min) / 5 + 1;
+        char dataSlot[12]; strftime(dataSlot, sizeof(dataSlot), "%Y_%m_%d", &slotTm);
+        if (todayStr == String(dataSlot)) puncteAzi = (slotTm.tm_hour*60+slotTm.tm_min)/5+1;
       }
-
-      FirebaseJson jsonArhiva;
-      jsonArhiva.set("PM25", extrageArhivaIeri(getPaddedHistory(istPM25, tNow, lastIstoricSaveTime), puncteAzi));
-      jsonArhiva.set("CO2",  extrageArhivaIeri(getPaddedHistory(istCO2,  tNow, lastIstoricSaveTime), puncteAzi));
-      jsonArhiva.set("VOC",  extrageArhivaIeri(getPaddedHistory(istVOC,  tNow, lastIstoricSaveTime), puncteAzi));
-      jsonArhiva.set("NOx",  extrageArhivaIeri(getPaddedHistory(istNOx,  tNow, lastIstoricSaveTime), puncteAzi));
-      jsonArhiva.set("Temp", extrageArhivaIeri(getPaddedHistory(istTemp, tNow, lastIstoricSaveTime), puncteAzi));
-      jsonArhiva.set("Umid", extrageArhivaIeri(getPaddedHistory(istUmid, tNow, lastIstoricSaveTime), puncteAzi));
-      Firebase.RTDB.setJSONAsync(&fbdoScriere, nodBaza, &jsonArhiva);
-
-      lastArchivedDateStr = todayStr;
-      Firebase.RTDB.setStringAsync(&fbdoScriere, "/SenzoriAer/last_archived_date", todayStr);
-
-      if (curentHour == 0 && curentMin < 5) logSystem("Arhiva pentru " + nodBaza.substring(27) + " creata!");
-      else                                   logSystem("Arhiva pentru " + nodBaza.substring(27) + " refacuta!");
-      updateState("Running_Loop");
-    } else if (lastArchivedDateStr == "" && WiFi.status() == WL_CONNECTED && Firebase.ready() && firebaseGata) {
-      lastArchivedDateStr = todayStr;
-      Firebase.RTDB.setStringAsync(&fbdoScriere, "/SenzoriAer/last_archived_date", todayStr);
+      String* serii[] = {&istPM25, &istCO2, &istVOC, &istNOx, &istTemp, &istUmid};
+      for (int i=0; i<6; ++i)
+        seriiInAsteptare[i] = extrageArhivaIeri(getPaddedHistory(*serii[i], tNow, lastIstoricSaveTime), puncteAzi);
+      arhivaAIncercat = false;
+    }
+    if (firebaseGata && WiFi.status() == WL_CONNECTED && Firebase.ready() &&
+        (!arhivaAIncercat || uint32_t(millis()-ultimaIncercareArhiva) >= 30000)) {
+      if (dataInAsteptare != "") {
+        arhivaAIncercat = true; ultimaIncercareArhiva = millis();
+        updateState("Confirmare_Arhiva_FB");
+        const String cale = "/SenzoriAer/Arhiva_Zilnica/" + dataInAsteptare;
+        bool citit = Firebase.RTDB.get(&fbdoCitire, cale);
+        const bool lipsa = fbdoCitire.httpCode() == FIREBASE_ERROR_PATH_NOT_EXIST || fbdoCitire.dataType() == "null";
+        if (citit || fbdoCitire.httpCode() == FIREBASE_ERROR_PATH_NOT_EXIST) {
+          if (lipsa || fbdoCitire.dataType() == "json") {
+            FirebaseJson patch;
+            for (int i=0; i<6; ++i) {
+              String veche;
+              if (!lipsa) {
+                FirebaseJsonData v;
+                fbdoCitire.jsonObject().get(v, numeArhiva[i]);
+                if (v.success) veche = v.stringValue;
+              }
+              // add pastreaza cheia cu slash-uri pentru PATCH multipath; set ar crea
+              // un obiect Arhiva_Zilnica imbricat si ar sterge celelalte zile din server.
+              patch.add("Arhiva_Zilnica/" + dataInAsteptare + "/" + numeArhiva[i], combinaArhivaZi(veche, seriiInAsteptare[i]));
+            }
+            // O singura scriere atomica, sincron confirmata: ziua si marcajul avanseaza impreuna.
+            patch.set("last_archived_date", ziDupaArhiva);
+            if (Firebase.RTDB.updateNodeSilent(&fbdoScriere, "/SenzoriAer", &patch)) {
+              lastArchivedDateStr = ziDupaArhiva;
+              logSystem("Arhiva confirmata: " + dataInAsteptare);
+              dataInAsteptare = "";
+              arhivaDiagnosticInAsteptare = dataInAsteptare;
+              for (int i=0; i<6; ++i) seriiInAsteptare[i] = "";
+            }
+          }
+        }
+        updateState("Running_Loop");
+      } else if (lastArchivedDateStr == "") {
+        arhivaAIncercat = true; ultimaIncercareArhiva = millis();
+        if (Firebase.RTDB.setString(&fbdoScriere, "/SenzoriAer/last_archived_date", todayStr))
+          lastArchivedDateStr = todayStr;
+      }
     }
 
     // Salvare istoric la fiecare 5 minute
-    if (curentMin % 5 == 0 && curentMin != lastSavedMin) {
-      lastSavedMin = curentMin;
+    const time_t slotCurent = tNow / 300;
+    if (curentMin % 5 == 0 && slotCurent > ultimulSlotSalvat &&
+        (lastIstoricSaveTime <= 0 || slotCurent > lastIstoricSaveTime / 300)) {
+      ultimulSlotSalvat = slotCurent;
       int intervalePierdute = 0;
       updateState("Salvare_Istoric_5Min");
 
       if (lastIstoricSaveTime > 0) {
-        intervalePierdute = ((tNow - lastIstoricSaveTime) / 300) - 1;
+        intervalePierdute = slotCurent - (lastIstoricSaveTime / 300) - 1;
         if (intervalePierdute < 0) intervalePierdute = 0;
         if (intervalePierdute > 288) intervalePierdute = 288;
       }
-      lastIstoricSaveTime = tNow;
+      lastIstoricSaveTime = slotCurent * 300;
 
       salveazaPunctIstoric(intervalePierdute);
 
-      if (WiFi.status() == WL_CONNECTED && Firebase.ready() && firebaseGata) {
+      if (firebaseGata && WiFi.status() == WL_CONNECTED && Firebase.ready()) {
         FirebaseJson jsonIstoric;
         jsonIstoric.set("Istoric_PM25",  istPM25);  jsonIstoric.set("Istoric_CO2",  istCO2);
         jsonIstoric.set("Istoric_VOC",   istVOC);   jsonIstoric.set("Istoric_NOx",  istNOx);
