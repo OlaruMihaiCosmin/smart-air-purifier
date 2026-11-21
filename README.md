@@ -25,6 +25,8 @@ unitate de control **ESP32-S3** (senzor de calitate a aerului, ecran TFT, contro
 ventilatoarelor) și o **aplicație Android** companion, sincronizate în timp real prin Firebase și
 notificări push FCM.
 
+**Versiunea publicată:** firmware `2026.10.01.1`, aplicația Android `2026.10.04.1`.
+
 ---
 
 ## Cuprins
@@ -44,24 +46,35 @@ notificări push FCM.
 **Monitorizare**
 - Dashboard live: PM1.0 / PM2.5 / PM4.0 / PM10, CO₂, indice VOC, indice NOx, temperatură,
   umiditate și turația ventilatoarelor (RPM)
-- Grafice istorice interactive (4h / 12h / 24h) și **arhivă pe 28 de zile**
-- **Scor zilnic** al calității aerului, export CSV
+- Grafice istorice interactive (4h / 12h / 24h) și **arhivă zilnică**, răsfoită în pagini de
+  4 săptămâni
+- **Scor** al calității aerului pe ultimele 24 h, export CSV
 
 **Purificare inteligentă**
 - Mod **AUTO** al ventilatoarelor cu histerezis asimetric (praguri inspirate din ghidurile EPA
   pentru PM2.5) — pornește repede la poluare, se oprește lent pentru stabilitate
-- Control manual al vitezei direct din aplicație sau de pe placă
+- Control manual al vitezei din aplicație
+- **TIMER:** treaptă manuală temporară (5 min – 4 h), cronometrată de placă chiar și cu
+  telefonul închis, apoi revenire automată în AUTO
 
 **Interfață și alerte**
 - Ecran **TFT ST7789** „flicker-free" pe placă + **LED RGB WS2812** de stare
+- **Bulină de stare cloud** pe ecran: roșu fără WiFi, portocaliu fără confirmare recentă de la
+  Firebase, verde conectat
 - **Widget** de home screen cu indicator de vechime a datelor
 - Notificări push: praguri de poluare (trimise **direct de placă** prin FCM) și **dispozitiv offline**
 
 **Fiabilitate**
 - Actualizare **OTA**, **watchdog** hardware, salvare locală a istoricului fără WiFi și
   re-sincronizare la reconectare
-- Calibrări senzor conform datasheet-ului SEN66: **FRC pentru CO₂** și **reset stare VOC**
-- Mod de noapte programabil (enforcement pe placă)
+- Scrieri confirmate în Firebase: placa detectează lipsa confirmărilor și se reautentifică fără
+  restart
+- Jurnal de evenimente trimis cu confirmare; arhiva zilnică protejată când ceasul sare înapoi
+- **Diagnostic:** versiunile firmware și aplicație, plus un raport complet al plăcii (WiFi,
+  memorie, senzor, ventilatoare, timer), copiat sau exportat TXT din aplicație
+- Calibrări senzor conform datasheet-ului SEN66: **FRC pentru CO₂** (comanda expiră după
+  120 s) și **reset stare VOC**
+- Mod de noapte programabil pentru ecran și LED (enforcement pe placă)
 
 ---
 
@@ -83,8 +96,8 @@ flowchart TB
 **Flux de date**
 - Placa citește senzorul SEN66 și **publică telemetria** în Realtime Database; aplicația o
   afișează live (stream RTDB).
-- Setările (praguri, mod AUTO, mod de noapte) se scriu din aplicație în RTDB; placa le preia
-  printr-un **stream** + un poll de siguranță la 60 s.
+- Setările și comenzile (praguri, mod AUTO, TIMER, mod de noapte) se scriu din aplicație în
+  RTDB; placa le preia printr-un **stream** + un poll de siguranță la 60 s.
 - La depășirea pragurilor, **placa trimite singură** notificarea FCM (HTTP v1) — fără serviciu
   de fundal permanent în aplicație.
 - Un **WorkManager** în aplicație verifică periodic prospețimea datelor (citire REST directă din
@@ -96,7 +109,7 @@ flowchart TB
 
 | Componentă | Detalii |
 |---|---|
-| **ESP32-S3** (WROOM, PSRAM OPI, flash mare) | Microcontroler principal, WiFi, OTA |
+| **ESP32-S3-DevKitC-1-N8R8** (8 MB flash, 8 MB PSRAM OPI) | Microcontroler principal, WiFi, OTA |
 | **Sensirion SEN66** | Senzor combo: particule (PM1–PM10), CO₂, VOC, NOx, temperatură, umiditate |
 | **Ecran TFT ST7789 2.0"** | Afișaj local al valorilor în timp real |
 | **LED WS2812 (NeoPixel)** | Indicator RGB de stare a calității aerului |
@@ -112,11 +125,22 @@ flowchart TB
 
 ```
 SmartAir/
-├── firmware/                     # Cod ESP32-S3 (Arduino / C++)
-│   ├── Esp_SmartPurifier.ino
-│   └── secrete.h.example         # Șablon credențiale (fără date reale)
-└── android/                      # Aplicație Android (Kotlin + Jetpack Compose)
-    ├── app/src/main/java/com/example/smartpurifier/MainActivity.kt
+├── firmware/                         # Cod ESP32-S3 (Arduino / C++)
+│   ├── Esp_SmartPurifier.ino         # Sketch-ul principal
+│   ├── SmartAirReliability.h         # Medii PM, NTP, validarea citirilor SEN66
+│   ├── SmartAirCloudHealth.h         # Starea conexiunii Firebase (confirmări, recuperare)
+│   ├── SmartAirTimer.h               # Logica TIMER (termen, protecție la cereri vechi)
+│   ├── secrete.h.example             # Șablon credențiale (fără date reale)
+│   └── tests/native/                 # Teste native C++ și scripturi Python
+└── android/                          # Aplicație Android (Kotlin + Jetpack Compose)
+    ├── app/src/main/java/com/example/smartpurifier/
+    │   ├── MainActivity.kt           # Interfață, date, worker, FCM, widget
+    │   ├── AirData.kt                # Grafice, arhivă și export (funcții pure)
+    │   ├── FanTimer.kt               # Contractul și comenzile TIMER
+    │   ├── DiagnosticReport.kt       # Raportul de diagnostic și exportul TXT
+    │   ├── ReliabilityActions.kt     # Ciclu de viață, export, versiuni
+    │   └── FirebaseSnapshotValues.kt # Citirea valorilor din Firebase
+    ├── app/src/test/                 # Teste JUnit
     └── secrete.properties.example
 ```
 
@@ -142,14 +166,23 @@ SmartAir/
 
 ## Compilare și rulare
 
-**Firmware** (Arduino IDE 2 + core ESP32, placă ESP32-S3)
+**Firmware** (Arduino IDE 2 + core ESP32 3.3.x, verificat cu 3.3.12)
+Placa ESP32S3 Dev Module: flash 8 MB QIO, PSRAM OPI, USB CDC On Boot activat.
 Biblioteci necesare: Adafruit GFX, Adafruit ST7735/ST7789, Adafruit NeoPixel,
 Sensirion I²C SEN66, Firebase ESP Client (Mobizt).
+
+Teste native (necesită `g++` în PATH):
+```bash
+python firmware/tests/native/run_all_tests.py
+```
+Câteva teste folosesc partea JSON a bibliotecii Firebase ESP Client instalate local; calea
+bibliotecii se ajustează în scripturi.
 
 **Android**
 ```bash
 cd android
 ./gradlew :app:assembleDebug
+./gradlew :app:testDebugUnitTest   # teste JUnit
 ```
 sau deschide folderul `android/` direct în Android Studio.
 
@@ -161,6 +194,7 @@ sau deschide folderul `android/` direct în Android Studio.
 - **Aplicație:** Kotlin, Jetpack Compose, WorkManager, Firebase Realtime Database & Messaging
 - **Cloud:** Firebase Realtime Database + Cloud Messaging
 - **Senzoristică:** Sensirion SEN66 (I²C)
+- **Teste:** C++ nativ (g++), Python, JUnit
 
 ---
 
